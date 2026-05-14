@@ -1,5 +1,5 @@
 # Derivative_Platform
-FINM3422 Assignment 3 – Joel, Leon, Max
+FINM3422 Assignment 3
 
 A prototype risk and derivatives modelling platform built for a trading desk.
 
