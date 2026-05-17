@@ -1,0 +1,61 @@
+# ===========================
+# Python
+# ===========================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Virtual environments
+venv/
+env/
+.venv/
+.env/
+ENV/
+
+# Environment variables (API keys, secrets)
+.env
+*.env
+
+# ===========================
+# Jupyter Notebook
+# ===========================
+.ipynb_checkpoints/
+*-checkpoint.ipynb
+
+# ===========================
+# macOS
+# ===========================
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# ===========================
+# VS Code
+# ===========================
+.vscode/
+*.code-workspace
+
+# ===========================
+# Data caches (optional — see note below)
+# ===========================
+# Uncomment if you don't want to commit raw downloaded data
+# data/raw/
+# *.csv
+
+# ===========================
+# Misc
+# ===========================
+*.log
+*.tmp
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
