@@ -286,3 +286,191 @@ class Portfolio:
             "Delta":              round(self.portfolio_delta(), 4),
         }
         return df
+    
+# ======================================================================
+# Risk Engine
+# ======================================================================
+
+class RiskEngine:
+    """
+    Computes portfolio risk metrics: VaR and scenario analysis.
+
+    Parameters
+    ----------
+    portfolio : Portfolio
+        The portfolio to analyse.
+    returns_df : pd.DataFrame
+        Daily log returns for the equity underlyings. Each column is a
+        ticker (e.g. "CBA.AX"), each row is a trading day.
+        Used for historical VaR and parametric volatility estimation.
+
+    Notes
+    -----
+    VaR is computed at the portfolio level using a delta-normal approximation:
+        - Equity positions contribute directly via their dollar weight.
+        - Option positions contribute via delta * S0 as their dollar equity
+          exposure (linear approximation).
+        - This does not capture the nonlinear (gamma) effect of options on P&L.
+
+    Full revaluation under each historical scenario would be more accurate
+    but computationally prohibitive for Monte Carlo-priced options. This
+    limitation is acknowledged in the presentation as a known simplification
+    consistent with a prototype trading desk system.
+    """
+
+    def __init__(self, portfolio, returns_df):
+        self.portfolio = portfolio
+        self.returns_df = returns_df.copy()
+
+    # ------------------------------------------------------------------
+    # VaR methods
+    # ------------------------------------------------------------------
+
+    def historical_var(self, confidence=0.95, horizon=1):
+        """
+        Historical simulation VaR.
+
+        Uses the empirical distribution of past portfolio P&L to find
+        the loss threshold at the given confidence level.
+
+        Procedure
+        ---------
+        1. Compute daily portfolio P&L from historical equity returns,
+           weighted by each position's dollar exposure.
+        2. Scale to the desired horizon (sqrt-of-time approximation).
+        3. Return the (1 - confidence) quantile of the loss distribution.
+
+        Parameters
+        ----------
+        confidence : float
+            Confidence level. Default 0.95 -> 95% VaR.
+        horizon : int
+            Holding period in days. Default 1 (1-day VaR).
+
+        Returns
+        -------
+        float
+            VaR in dollars. Positive number = potential loss.
+        """
+        port_returns = self._portfolio_returns()
+        scaled_returns = port_returns * np.sqrt(horizon)
+        var = -np.quantile(scaled_returns, 1 - confidence)
+        return float(var)
+
+    def parametric_var(self, confidence=0.95, horizon=1):
+        """
+        Parametric (variance-covariance) VaR.
+
+        Assumes portfolio returns are normally distributed. Uses the
+        historical standard deviation of portfolio returns scaled to
+        the desired horizon.
+
+        Procedure
+        ---------
+        1. Compute daily portfolio returns (same as historical VaR).
+        2. Estimate portfolio volatility as the standard deviation.
+        3. VaR = z_alpha * sigma * sqrt(horizon) * abs(portfolio_value)
+
+        Parameters
+        ----------
+        confidence : float
+            Confidence level. Default 0.95 -> z = 1.645.
+        horizon : int
+            Holding period in days. Default 1.
+
+        Returns
+        -------
+        float
+            VaR in dollars. Positive number = potential loss.
+        """
+        port_returns = self._portfolio_returns()
+        sigma = port_returns.std()
+        z = norm.ppf(confidence)
+        portfolio_value = self.portfolio.total_value()
+        var = z * sigma * np.sqrt(horizon) * abs(portfolio_value)
+        return float(var)
+
+    def var_summary(self, confidence=0.95, horizon=1):
+        """
+        Return a DataFrame comparing historical and parametric VaR.
+
+        Useful for displaying in the notebook and discussing the
+        normality assumption as a limitation.
+        """
+        hist = self.historical_var(confidence, horizon)
+        para = self.parametric_var(confidence, horizon)
+        portfolio_value = self.portfolio.total_value()
+
+        return pd.DataFrame({
+            "Method":         ["Historical", "Parametric"],
+            "Confidence":     [f"{confidence:.0%}", f"{confidence:.0%}"],
+            "Horizon (days)": [horizon, horizon],
+            "VaR ($)":        [round(hist, 2), round(para, 2)],
+            "VaR (% NAV)":    [
+                f"{hist / portfolio_value:.2%}",
+                f"{para / portfolio_value:.2%}",
+            ],
+        })
+
+    # ------------------------------------------------------------------
+    # Scenario analysis
+    # ------------------------------------------------------------------
+
+    def scenario_analysis(self, spot_shocks=None, rate_shocks=None):
+        """
+        Reprice the portfolio under a grid of spot and rate shocks.
+
+        For each combination of shocks, every position is repriced:
+            - EquityPosition : new_spot = current_spot * (1 + spot_shock)
+            - OptionPosition : new S0 and/or new yield curve (parallel shift)
+
+        Parameters
+        ----------
+        spot_shocks : list of float, optional
+            Fractional spot price changes.
+            Default: [-0.20, -0.10, -0.05, 0.0, 0.05, 0.10, 0.20]
+        rate_shocks : list of float, optional
+            Parallel yield curve shifts in decimal.
+            Default: [-0.01, -0.005, 0.0, 0.005, 0.01]  (±50bps, ±100bps)
+
+        Returns
+        -------
+        pd.DataFrame
+            Rows = spot shocks, Columns = rate shocks.
+            Each cell = portfolio P&L relative to base value (AUD).
+        """
+        if spot_shocks is None:
+            spot_shocks = [-0.20, -0.10, -0.05, 0.0, 0.05, 0.10, 0.20]
+        if rate_shocks is None:
+            rate_shocks = [-0.01, -0.005, 0.0, 0.005, 0.01]
+
+        base_value = self.portfolio.total_value()
+        results = {}
+
+        for rate_shock in rate_shocks:
+            col_pnl = []
+            for spot_shock in spot_shocks:
+                shocked_value = self._reprice_portfolio(spot_shock, rate_shock)
+                pnl = shocked_value - base_value
+                col_pnl.append(round(pnl, 2))
+            col_label = f"Rate {rate_shock * 10000:+.0f}bps"
+            results[col_label] = col_pnl
+
+        index_labels = [f"Spot {s * 100:+.0f}%" for s in spot_shocks]
+        return pd.DataFrame(results, index=index_labels)
+
+    def scenario_pnl_table(self, spot_shocks=None, rate_shocks=None):
+        """
+        Return both a dollar P&L table and a percentage P&L table.
+        Useful for displaying side-by-side in the notebook.
+
+        Returns
+        -------
+        dollar_pnl : pd.DataFrame
+        pct_pnl    : pd.DataFrame
+        """
+        base_value = self.portfolio.total_value()
+        dollar_pnl = self.scenario_analysis(spot_shocks, rate_shocks)
+        pct_pnl = (dollar_pnl / abs(base_value) * 100).round(2)
+        pct_pnl = pct_pnl.map(lambda x: f"{x:+.2f}%")
+        return dollar_pnl, pct_pnl
