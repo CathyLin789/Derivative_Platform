@@ -9,7 +9,7 @@ compares the continuation value against the immediate-exercise
 payoff and takes the maximum.
 """
 
-from .base import Derivative
+from .base_derivatives import Derivative
 
 
 class AmericanCall(Derivative):

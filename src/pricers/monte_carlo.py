@@ -8,7 +8,7 @@ Monte Carlo pricer for European and path-dependent options
 import numpy as np
 from scipy.stats import norm
 
-from .base import Pricer
+from .base_pricers import Pricer
 
 
 class MonteCarloPricer(Pricer):

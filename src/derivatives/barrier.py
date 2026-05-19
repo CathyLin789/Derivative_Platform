@@ -20,7 +20,7 @@ will be implemented as a separate workstream after the folder
 refactor is verified.
 """
 
-from .base import Derivative
+from .base_derivatives import Derivative
 
 
 class BarrierCall(Derivative):

@@ -11,7 +11,7 @@ callers can write:
 without needing to know which file each class lives in.
 """
 
-from .base import Pricer
+from .base_pricers import Pricer
 from .black_scholes import BlackScholesPricer
 from .binomial import BinomialTreePricer
 from .monte_carlo import MonteCarloPricer
