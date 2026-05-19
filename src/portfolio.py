@@ -474,3 +474,116 @@ class RiskEngine:
         pct_pnl = (dollar_pnl / abs(base_value) * 100).round(2)
         pct_pnl = pct_pnl.map(lambda x: f"{x:+.2f}%")
         return dollar_pnl, pct_pnl
+    
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _portfolio_returns(self):
+        """
+        Compute daily portfolio-level returns as a weighted sum of
+        equity returns, where weights are proportional to dollar exposure.
+
+        Equity positions: weight = position value / total portfolio value
+        Option positions: weight = (delta * S0) / total portfolio value
+                          (delta-normal approximation)
+        """
+        total_value = self.portfolio.total_value()
+        port_returns = pd.Series(
+            np.zeros(len(self.returns_df)), index=self.returns_df.index
+        )
+
+        for p in self.portfolio.positions:
+            if isinstance(p, EquityPosition):
+                ticker = p.ticker
+                if ticker not in self.returns_df.columns:
+                    raise ValueError(
+                        f"Ticker {ticker!r} not found in returns_df. "
+                        f"Available: {list(self.returns_df.columns)}"
+                    )
+                weight = p.value() / total_value
+                port_returns += weight * self.returns_df[ticker]
+
+            elif isinstance(p, OptionPosition):
+                underlying_ticker = _infer_ticker(p)
+                if underlying_ticker and underlying_ticker in self.returns_df.columns:
+                    dollar_delta = p.delta() * p.contract.S0
+                    weight = dollar_delta / total_value
+                    port_returns += weight * self.returns_df[underlying_ticker]
+
+        return port_returns
+
+    def _reprice_portfolio(self, spot_shock, rate_shock):
+        """
+        Return total portfolio value after applying spot and rate shocks.
+
+        Spot shock applied proportionally to each position's current S0.
+        Rate shock is a parallel shift applied to the yield curve.
+        """
+        total = 0.0
+        for p in self.portfolio.positions:
+            if isinstance(p, EquityPosition):
+                new_spot = p.spot_price * (1.0 + spot_shock)
+                shocked = p.reprice(new_spot=new_spot)
+                total += shocked.value()
+
+            elif isinstance(p, OptionPosition):
+                new_spot = p.contract.S0 * (1.0 + spot_shock)
+                new_yc = _shift_yield_curve(p.contract.yield_curve, rate_shock)
+                shocked = p.reprice(new_spot=new_spot, new_yield_curve=new_yc)
+                total += shocked.value()
+
+        return total
+
+
+# ======================================================================
+# Internal utility functions
+# ======================================================================
+
+def _clone_contract_with(contract, **overrides):
+    """
+    Return a new contract of the same type as `contract`, with any
+    parameters in `overrides` replaced.
+
+    Used by OptionPosition.delta() and OptionPosition.reprice() to create
+    shocked versions of a contract without modifying the original.
+    """
+    params = {
+        "S0":          contract.S0,
+        "K":           contract.K,
+        "T":           contract.T,
+        "sigma":       contract.sigma,
+        "yield_curve": contract.yield_curve,
+        "q":           contract.q,
+    }
+    params.update(overrides)
+    return type(contract)(**params)
+
+
+def _shift_yield_curve(yield_curve, shift):
+    """
+    Return a new YieldCurve with all zero rates shifted by `shift` (decimal).
+
+    Used for parallel rate shock scenarios, e.g. shift=0.005 -> +50bps.
+    """
+    from src.yieldcurve import YieldCurve
+    shifted_rates = yield_curve.zero_rates + shift
+    return YieldCurve(
+        maturities=yield_curve.maturities.copy(),
+        zero_rates=shifted_rates,
+        compounding=yield_curve.compounding,
+    )
+
+
+def _infer_ticker(option_position):
+    """
+    Extract the underlying ticker from an OptionPosition's label.
+
+    Convention: labels start with the ticker, e.g. "CBA.AX Put 6m OTM".
+    Returns None if the ticker cannot be inferred.
+    """
+    label = option_position.label or ""
+    tokens = label.split()
+    if tokens and tokens[0].endswith(".AX"):
+        return tokens[0]
+    return None
