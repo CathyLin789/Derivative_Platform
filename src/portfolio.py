@@ -3,7 +3,7 @@ portfolio.py
 ------------
 Portfolio construction and risk analysis layer.
 
-Sits on top of derivatives.py, pricers.py, and yieldcurve.py to provide:
+Sits on top of derivatives/, pricers/, and yieldcurve.py to provide:
     - EquityPosition   : a long/short equity holding
     - OptionPosition   : a long/short derivative position with an attached pricer
     - Portfolio        : a collection of positions with aggregate valuation and delta
@@ -15,7 +15,7 @@ Design principle (consistent with the rest of the platform):
     This keeps the risk engine reusable across different portfolio compositions.
 
 Usage example (see trading_desk_analysis.ipynb for full demo):
-    from src.derivatives import EuropeanCall, EuropeanPut, AsianCall
+    from src.derivatives import EuropeanCall, EuropeanPut
     from src.pricers import BlackScholesPricer, MonteCarloPricer
     from src.portfolio import EquityPosition, OptionPosition, Portfolio, RiskEngine
     from src.yieldcurve import load_rba_yield_curve, YieldCurve
@@ -120,17 +120,17 @@ class OptionPosition:
     Parameters
     ----------
     contract : Derivative
-        A derivative contract (EuropeanCall, EuropeanPut, AsianCall, etc.)
-        as defined in src/derivatives.py.
+        A derivative contract (EuropeanCall, EuropeanPut, BarrierCall, etc.)
+        as defined in src/derivatives/.
     pricer : Pricer
         A compatible pricer (BlackScholesPricer, MonteCarloPricer, etc.)
-        as defined in src/pricers.py.
+        as defined in src/pricers/.
     quantity : float
         Number of contracts held. Positive = long.
     label : str, optional
         Human-readable label for reporting (e.g. "CBA.AX Put 6m OTM").
         Convention: start with the ticker so RiskEngine can infer the
-        underlying (e.g. "CBA.AX Put 6m OTM", "BHP.AX Asian Call 3m ATM").
+        underlying (e.g. "CBA.AX Put 6m OTM", "BHP.AX Call 3m ATM").
 
     Notes
     -----
@@ -554,7 +554,6 @@ def _clone_contract_with(contract, **overrides):
         "T":           contract.T,
         "sigma":       contract.sigma,
         "yield_curve": contract.yield_curve,
-        "q":           contract.q,
     }
     params.update(overrides)
     return type(contract)(**params)
