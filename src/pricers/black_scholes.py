@@ -7,7 +7,7 @@ Black-Scholes closed-form pricer for European options.
 import numpy as np
 from scipy.stats import norm
 
-from .base import Pricer
+from .base_pricers import Pricer
 
 
 class BlackScholesPricer(Pricer):

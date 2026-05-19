@@ -7,7 +7,7 @@ Priced analytically via the Black-Scholes formula
 (see src/pricers/black_scholes.py).
 """
 
-from .base import Derivative
+from .base_derivatives import Derivative
 
 
 class EuropeanCall(Derivative):

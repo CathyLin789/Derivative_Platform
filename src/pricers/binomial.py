@@ -6,7 +6,7 @@ Cox-Ross-Rubinstein binomial tree pricer for European and American options.
 
 import numpy as np
 
-from .base import Pricer
+from .base_pricers import Pricer
 
 
 class BinomialTreePricer(Pricer):

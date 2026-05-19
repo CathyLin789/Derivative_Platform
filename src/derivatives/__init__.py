@@ -11,7 +11,7 @@ callers can write:
 without needing to know which file each class lives in.
 """
 
-from .base import Derivative
+from .base_derivatives import Derivative
 from .european import EuropeanCall, EuropeanPut
 from .american import AmericanCall, AmericanPut
 from .barrier import BarrierCall, BarrierPut
