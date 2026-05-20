@@ -23,14 +23,15 @@ Usage example (see trading_desk_analysis.ipynb for full demo):
     maturities, rates, snap = load_rba_yield_curve("data/f2-data.csv")
     yc = YieldCurve(maturities, rates)
 
-    cba_equity = EquityPosition(ticker="CBA.AX", quantity=100, spot_price=138.50)
-    cba_put    = OptionPosition(
-                     contract=EuropeanPut(S0=138.50, K=131.57, T=0.5, sigma=0.18, yield_curve=yc),
+    aapl_equity = EquityPosition(ticker="AAPL", quantity=100, spot_price=297.84)
+    aapl_put    = OptionPosition(
+                     contract=EuropeanPut(S0=297.84, K=290.0, T=0.5, sigma=0.27, yield_curve=yc),
                      pricer=BlackScholesPricer(),
                      quantity=2,
-                     label="CBA.AX Put 6m OTM"
+                     underlying_ticker="AAPL",
+                     label="AAPL Put 6m OTM",
                  )
-    portfolio  = Portfolio([cba_equity, cba_put])
+    portfolio  = Portfolio([aapl_equity, aapl_put])
     engine     = RiskEngine(portfolio, returns_df)
     print(engine.historical_var())
 """
@@ -51,7 +52,7 @@ class EquityPosition:
     Parameters
     ----------
     ticker : str
-        ASX ticker (e.g. "CBA.AX"). Used for labelling and linking to
+        Ticker symbol (e.g. "AAPL"). Used for labelling and linking to
         return data in the RiskEngine.
     quantity : float
         Number of shares held. Positive = long.
@@ -127,10 +128,14 @@ class OptionPosition:
         as defined in src/pricers/.
     quantity : float
         Number of contracts held. Positive = long.
+    underlying_ticker : str
+        Ticker of the underlying equity (e.g. "AAPL"). Required so the
+        RiskEngine can link this position to the correct column in the
+        historical returns DataFrame. Making this explicit (rather than
+        parsing it from the label) is robust to any ticker convention.
     label : str, optional
-        Human-readable label for reporting (e.g. "CBA.AX Put 6m OTM").
-        Convention: start with the ticker so RiskEngine can infer the
-        underlying (e.g. "CBA.AX Put 6m OTM", "BHP.AX Call 3m ATM").
+        Human-readable label for reporting (e.g. "AAPL Put 6m OTM").
+        Defaults to the contract's repr if not given.
 
     Notes
     -----
@@ -146,10 +151,11 @@ class OptionPosition:
     # Relative bump size for finite-difference delta (0.1% of spot)
     _DELTA_BUMP = 1e-3
 
-    def __init__(self, contract, pricer, quantity, label=None):
+    def __init__(self, contract, pricer, quantity, underlying_ticker, label=None):
         self.contract = contract
         self.pricer = pricer
         self.quantity = float(quantity)
+        self.underlying_ticker = underlying_ticker
         self.label = label or repr(contract)
 
     def value(self):
@@ -189,8 +195,8 @@ class OptionPosition:
         Returns
         -------
         OptionPosition
-            A new position with the same quantity, pricer, and label,
-            but with a contract built from the shocked inputs.
+            A new position with the same quantity, pricer, underlying_ticker,
+            and label, but with a contract built from the shocked inputs.
         """
         new_S0 = new_spot if new_spot is not None else self.contract.S0
         new_yc = new_yield_curve if new_yield_curve is not None else self.contract.yield_curve
@@ -202,6 +208,7 @@ class OptionPosition:
             contract=shocked_contract,
             pricer=self.pricer,
             quantity=self.quantity,
+            underlying_ticker=self.underlying_ticker,
             label=self.label,
         )
 
@@ -228,18 +235,25 @@ class Portfolio:
     Methods
     -------
     total_value()       -> float         : sum of all position values
+    value()             -> float         : alias for total_value() (tutorial convention)
     portfolio_delta()   -> float         : sum of all position deltas
+    delta()             -> float         : alias for portfolio_delta() (tutorial convention)
+    add_position(p)                       : append a new position
     summary_table()     -> pd.DataFrame  : per-position breakdown
     """
 
     def __init__(self, positions):
         if not positions:
             raise ValueError("Portfolio must contain at least one position.")
-        self.positions = positions
+        self.positions = list(positions)
 
     def total_value(self):
         """Aggregate mark-to-market value of the portfolio (AUD)."""
         return sum(p.value() for p in self.positions)
+
+    def value(self):
+        """Alias for total_value() to match the tutorial convention."""
+        return self.total_value()
 
     def portfolio_delta(self):
         """
@@ -250,6 +264,19 @@ class Portfolio:
         is a simplification — it assumes all underlyings move together.
         """
         return sum(p.delta() for p in self.positions)
+
+    def delta(self):
+        """Alias for portfolio_delta() to match the tutorial convention."""
+        return self.portfolio_delta()
+
+    def add_position(self, position):
+        """
+        Append a new EquityPosition or OptionPosition to the portfolio.
+
+        Useful for building a portfolio incrementally in the notebook
+        rather than passing every position at construction time.
+        """
+        self.positions.append(position)
 
     def summary_table(self):
         """
@@ -286,7 +313,8 @@ class Portfolio:
             "Delta":              round(self.portfolio_delta(), 4),
         }
         return df
-    
+
+
 # ======================================================================
 # Risk Engine
 # ======================================================================
@@ -301,7 +329,7 @@ class RiskEngine:
         The portfolio to analyse.
     returns_df : pd.DataFrame
         Daily log returns for the equity underlyings. Each column is a
-        ticker (e.g. "CBA.AX"), each row is a trading day.
+        ticker (e.g. "AAPL"), each row is a trading day.
         Used for historical VaR and parametric volatility estimation.
 
     Notes
@@ -354,7 +382,8 @@ class RiskEngine:
         """
         port_returns = self._portfolio_returns()
         scaled_returns = port_returns * np.sqrt(horizon)
-        var = -np.quantile(scaled_returns, 1 - confidence)
+        portfolio_value = self.portfolio.total_value()
+        var = -np.quantile(scaled_returns, 1 - confidence) * abs(portfolio_value)
         return float(var)
 
     def parametric_var(self, confidence=0.95, horizon=1):
@@ -474,7 +503,7 @@ class RiskEngine:
         pct_pnl = (dollar_pnl / abs(base_value) * 100).round(2)
         pct_pnl = pct_pnl.map(lambda x: f"{x:+.2f}%")
         return dollar_pnl, pct_pnl
-    
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -482,7 +511,8 @@ class RiskEngine:
     def _portfolio_returns(self):
         """
         Compute daily portfolio-level returns as a weighted sum of
-        equity returns, where weights are proportional to dollar exposure.
+        underlying-ticker returns, where weights are proportional to
+        dollar exposure.
 
         Equity positions: weight = position value / total portfolio value
         Option positions: weight = (delta * S0) / total portfolio value
@@ -505,11 +535,16 @@ class RiskEngine:
                 port_returns += weight * self.returns_df[ticker]
 
             elif isinstance(p, OptionPosition):
-                underlying_ticker = _infer_ticker(p)
-                if underlying_ticker and underlying_ticker in self.returns_df.columns:
-                    dollar_delta = p.delta() * p.contract.S0
-                    weight = dollar_delta / total_value
-                    port_returns += weight * self.returns_df[underlying_ticker]
+                ticker = p.underlying_ticker
+                if ticker not in self.returns_df.columns:
+                    raise ValueError(
+                        f"Underlying ticker {ticker!r} for option position "
+                        f"{p.label!r} not found in returns_df. "
+                        f"Available: {list(self.returns_df.columns)}"
+                    )
+                dollar_delta = p.delta() * p.contract.S0
+                weight = dollar_delta / total_value
+                port_returns += weight * self.returns_df[ticker]
 
         return port_returns
 
@@ -572,17 +607,3 @@ def _shift_yield_curve(yield_curve, shift):
         zero_rates=shifted_rates,
         compounding=yield_curve.compounding,
     )
-
-
-def _infer_ticker(option_position):
-    """
-    Extract the underlying ticker from an OptionPosition's label.
-
-    Convention: labels start with the ticker, e.g. "CBA.AX Put 6m OTM".
-    Returns None if the ticker cannot be inferred.
-    """
-    label = option_position.label or ""
-    tokens = label.split()
-    if tokens and tokens[0].endswith(".AX"):
-        return tokens[0]
-    return None
