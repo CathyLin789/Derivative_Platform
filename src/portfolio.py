@@ -20,7 +20,7 @@ Usage example (see trading_desk_analysis.ipynb for full demo):
     from src.portfolio import EquityPosition, OptionPosition, Portfolio, RiskEngine
     from src.yieldcurve import load_rba_yield_curve, YieldCurve
 
-    maturities, rates, snap = load_rba_yield_curve("data/f2-data.csv")
+    maturities, rates, snap = load_rba_yield_curve("data/RBA_Government_Bond_Yields")
     yc = YieldCurve(maturities, rates)
 
     aapl_equity = EquityPosition(ticker="AAPL", quantity=100, spot_price=297.84)
