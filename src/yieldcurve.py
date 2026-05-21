@@ -1,40 +1,22 @@
 import numpy as np
-import matplotlib.pyplot as plt
-
-"""
-data.py
--------
-Data ingestion functions for the platform.
-
-Design principle:
-    Data sources are passed in as paths/parameters, not hard-coded
-    inside class definitions. This keeps pricing logic decoupled
-    from data sourcing, and lets the system "drop in" new data
-    files without code changes elsewhere.
-
-Currently implemented:
-    load_rba_yield_curve   - parse RBA F2 CSV into yield curve inputs
-    validate_yield_data    - sanity-check yield curve data before use
-    list_available_dates   - inspect what historical dates the file has
-
-Equity price ingestion (yfinance) will be added in a later iteration
-once portfolio underlyings are decided.
-"""
-
-import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
+import re
 
 
-# Maturity (in years) of each RBA nominal Government Bond series.
-# The indexed-bond column is intentionally excluded -- it is a real-yield
-# (inflation-linked) curve, not a nominal one, and the pricing engine
-# expects nominal zero rates.
-_RBA_NOMINAL_MATURITIES = {
-    "Australian Government 2 year bond": 2.0,
-    "Australian Government 3 year bond": 3.0,
-    "Australian Government 5 year bond": 5.0,
-    "Australian Government 10 year bond": 10.0,
-}
+"""
+src/yieldcurve.py
+-----------------
+Yield curve construction and data ingestion.
+ 
+Public API:
+    load_rba_yield_curve  -- parse RBA F17 CSV → (maturities, zero_rates, date)
+    validate_yield_data   -- sanity-check arrays before use
+    list_available_dates  -- available dates in the CSV
+    spot_check_table      -- zero rates + discount factors at key maturities
+    plot_yield_curve      -- zero-rate + discount factor chart
+    YieldCurve            -- interpolating yield curve class
+"""
 
 # Row index (0-based) where the dated time series begins in the RBA F2 CSV.
 # Rows 0-10 are metadata (title, description, frequency, type, units,
@@ -43,92 +25,41 @@ _RBA_NOMINAL_MATURITIES = {
 _RBA_METADATA_ROWS = 11
 
 
-def load_rba_yield_curve(path, date=None):
-    """
-    Load a nominal Australian Government bond yield curve from the
-    RBA F2 daily CSV.
-
-    The RBA file has 11 metadata rows at the top, then daily observations
-    of bond yields at fixed maturities (2y, 3y, 5y, 10y) plus an indexed
-    (real-yield) series which we exclude. Yields are quoted in per cent
-    per annum; this function converts them to decimals.
-
-    Parameters
-    ----------
-    path : str
-        Path to the RBA F2 CSV file.
-    date : str, pandas.Timestamp, or None
-        Snapshot date to extract.
-            - None (default): the most recent date with complete data
-            - "YYYY-MM-DD" string or Timestamp: that specific date
-        If the requested date is missing or has any blank maturity,
-        a ValueError is raised.
-
-    Returns
-    -------
-    maturities : np.ndarray
-        Maturities in years, sorted ascending. e.g. [2.0, 3.0, 5.0, 10.0]
-    zero_rates : np.ndarray
-        Decimal yields aligned to `maturities`. e.g. [0.047, 0.047, ...]
-    snapshot_date : pandas.Timestamp
-        The actual date the data was sourced from.
-
-    Examples
-    --------
-    >>> maturities, rates, date = load_rba_yield_curve("data/raw/f2-data.csv")
-    >>> yc = YieldCurve(maturities, rates)
-    """
+def load_rba_yield_curve (path, date=None):
+    """Parse RBA F17 CSV → (maturities, zero_rates, snap_date). date=None returns most recent row."""
     df = _read_rba_csv(path)
 
-    # Restrict to nominal bond columns only, in maturity order
-    nominal_cols = [c for c in _RBA_NOMINAL_MATURITIES if c in df.columns]
-    if not nominal_cols:
-        raise ValueError(
-            f"None of the expected RBA nominal bond columns were found in "
-            f"{path}. Got columns: {list(df.columns)}"
-        )
-    df = df[nominal_cols].copy()
+    mat_map = {col: float(m.group(1))
+               for col in df.columns
+               if (m := re.search(r"([\d.]+)\s*yr", col))}
+ 
+    if not mat_map:
+        raise ValueError(f"No maturity columns found in {path}.")
+ 
+    df = df[list(mat_map.keys())].copy()
 
     # Pick the snapshot row
     if date is None:
-        # Most recent date with all maturities populated
-        valid_rows = df.dropna(how="any")
-        if valid_rows.empty:
-            raise ValueError(
-                "No date in the file has data for every nominal maturity."
-            )
-        snapshot_date = valid_rows.index[-1]
-        row = valid_rows.iloc[-1]
+        valid = df.dropna(how="any")
+        if valid.empty:
+            raise ValueError("No complete row found.")
+        snap_date, row = valid.index[-1], valid.iloc[-1]
     else:
-        snapshot_date = pd.Timestamp(date)
-        if snapshot_date not in df.index:
-            raise ValueError(
-                f"Date {snapshot_date.date()} not found in the RBA file. "
-                f"Available range: {df.index.min().date()} to {df.index.max().date()}."
-            )
-        row = df.loc[snapshot_date]
+        snap_date = pd.Timestamp(date)
+        if snap_date not in df.index:
+            raise ValueError(f"{snap_date.date()} not in file ({df.index.min().date()} – {df.index.max().date()}).")
+        row = df.loc[snap_date]
         if row.isna().any():
-            missing = row[row.isna()].index.tolist()
-            raise ValueError(
-                f"Date {snapshot_date.date()} is missing values for: {missing}"
-            )
-
-    # Build aligned arrays of maturities and (decimal) zero rates
-    maturities = np.array(
-        [_RBA_NOMINAL_MATURITIES[c] for c in nominal_cols], dtype=float
-    )
-    zero_rates = np.array(row.values, dtype=float) / 100.0   # per-cent -> decimal
-
-    # Sort by maturity (RBA columns are already in order, but be defensive)
+            raise ValueError(f"{snap_date.date()} has missing values.")
+        
+    maturities = np.array([mat_map[c] for c in mat_map], dtype=float)
+    zero_rates = np.array(row[list(mat_map.keys())].values, dtype=float) / 100.0
     order = np.argsort(maturities)
-    maturities = maturities[order]
-    zero_rates = zero_rates[order]
-
-    return maturities, zero_rates, snapshot_date
+    return maturities[order], zero_rates[order], snap_date
 
 
 def validate_yield_data(maturities, zero_rates,
-                        min_rate=-0.02, max_rate=0.25,
+                        min_rate=-0.05, max_rate=0.25,
                         max_jump=0.05):
     """
     Sanity-check a yield curve before passing it into the pricing engine.
@@ -177,8 +108,8 @@ def validate_yield_data(maturities, zero_rates,
     if np.any(~np.isfinite(maturities)) or np.any(~np.isfinite(zero_rates)):
         raise ValueError("NaN or infinite values present in yield curve data")
 
-    if np.any(maturities <= 0):
-        raise ValueError("All maturities must be strictly positive")
+    if np.any(maturities < 0):
+        raise ValueError("Maturities must be non-negative.")
 
     if not np.all(np.diff(maturities) > 0):
         raise ValueError("Maturities must be strictly increasing")
@@ -200,14 +131,8 @@ def validate_yield_data(maturities, zero_rates,
 
 
 def list_available_dates(path):
-    """
-    Return all dates that appear in the RBA F2 CSV, sorted ascending.
-
-    Useful for sanity-checking what historical snapshots are available
-    before requesting one with `date=...` in load_rba_yield_curve().
-    """
-    df = _read_rba_csv(path)
-    return df.index.sort_values()
+    """Return all dates in the CSV sorted ascending."""
+    return _read_rba_csv(path).index.sort_values()
 
 
 # ----------------------------------------------------------------------

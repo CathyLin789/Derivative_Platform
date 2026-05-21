@@ -245,7 +245,7 @@ def load_equity_panel(
     tickers,
     start_date,
     end_date,
-    cache_dir="data/equities",
+    cache_dir=None,
     refresh=False,
 ):
     """
@@ -281,6 +281,10 @@ def load_equity_panel(
     """
     if not tickers:
         raise ValueError("tickers must be a non-empty list.")
+
+    if cache_dir is None:
+        cache_dir = Path(__file__).parent.parent / "data" / "equities"
+    cache_dir = Path(cache_dir)
 
     cache_dir = Path(cache_dir)
 
