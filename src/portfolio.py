@@ -582,7 +582,12 @@ def _clone_contract_with(contract, **overrides):
 
     Used by OptionPosition.delta() and OptionPosition.reprice() to create
     shocked versions of a contract without modifying the original.
+
+    Carries forward base Derivative parameters plus any contract-specific
+    parameters (e.g. barrier, barrier_type for BarrierCall/BarrierPut)
+    so that subclasses with extended __init__ signatures clone correctly.
     """
+    # Base parameters every Derivative subclass accepts
     params = {
         "S0":          contract.S0,
         "K":           contract.K,
@@ -590,6 +595,10 @@ def _clone_contract_with(contract, **overrides):
         "sigma":       contract.sigma,
         "yield_curve": contract.yield_curve,
     }
+    # Barrier-specific parameters, present only on BarrierCall/BarrierPut
+    if hasattr(contract, "barrier"):
+        params["barrier"]      = contract.barrier
+        params["barrier_type"] = contract.barrier_type
     params.update(overrides)
     return type(contract)(**params)
 
