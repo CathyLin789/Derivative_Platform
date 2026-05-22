@@ -6,12 +6,21 @@ Portfolio construction and risk analysis layer.
 Sits on top of derivatives/, pricers/, and yieldcurve.py to provide:
     - EquityPosition   : a long/short equity holding
     - OptionPosition   : a long/short derivative position with an attached pricer
-    - Portfolio        : a collection of positions with aggregate valuation and delta
-    - RiskEngine       : VaR (historical and parametric) and scenario analysis
-
+    - Portfolio        : a collection of positions with aggregate valuation and Greeks
+    - RiskEngine       : VaR (historical and parametric), scenario analysis,
+                         and delta-linearisation vs full-revaluation P&L curves
+ 
 Design principle (consistent with the rest of the platform):
     This module does NOT hard-code any specific stocks or options.
     Positions are constructed externally (e.g. in the notebook) and passed in.
+ 
+Greeks design note:
+    All Greeks are computed via central finite difference on the contract's
+    underlying inputs. This is *model-consistent*: it works for any pricer
+    (Black-Scholes, binomial tree, Monte Carlo) without requiring closed-form
+    derivatives. Equity positions return zero for gamma and vega — equity is
+    linear in spot and has no volatility exposure — which keeps Portfolio
+    aggregation polymorphic (no isinstance branches in the aggregation loop).
 """
 
 import numpy as np
@@ -45,9 +54,26 @@ class EquityPosition:
         return self.quantity * self.spot_price
 
     def delta(self):
-        """ Unit delta = 1.0 for equity. Position delta = quantity."""
+        """Unit delta = 1.0 for equity. Position delta = quantity * 1.0."""
         return 1.0
-
+ 
+    def gamma(self):
+        """Equity is linear in spot — zero gamma."""
+        return 0.0
+ 
+    def vega(self):
+        """Equity has no volatility exposure — zero vega."""
+        return 0.0
+ 
+    def delta_dollars(self):
+        """
+        Delta-dollars = position's first-order $ sensitivity to a 100%
+        proportional move in its underlying.
+ 
+        For equity: delta_dollars = quantity * spot * 1.0 = market value.
+        """
+        return self.quantity * self.spot_price * self.delta()
+ 
     def reprice(self, new_spot=None, new_yield_curve=None):
         """Return a new EquityPosition with shocked spot price."""
         spot = new_spot if new_spot is not None else self.spot_price
@@ -56,7 +82,7 @@ class EquityPosition:
             quantity=self.quantity,
             spot_price=spot,
         )
-
+ 
     def __repr__(self):
         return (
             f"EquityPosition(ticker={self.ticker!r}, "
@@ -68,46 +94,93 @@ class OptionPosition:
     """
     A long derivative position with an attached pricer.
  
-    Delta is computed via central finite difference on S0 — model-consistent
-    and works for any pricer including Monte Carlo.
+    Greeks (delta, gamma, vega) are all computed via central finite difference
+    on the contract's inputs — model-consistent and works for any pricer.
+ 
+    Note on conventions:
+        - `delta()`, `gamma()`, `vega()` return *position-level* values
+          (already multiplied by quantity).
+        - This matches the existing delta() convention used elsewhere in the
+          codebase; do not pass these into formulas that re-multiply by qty.
     """
-    # Relative bump size for finite-difference delta (0.1% of spot)
-    _DELTA_BUMP = 1e-3
-
+    # Relative bump sizes for finite-difference Greeks
+    _DELTA_BUMP = 1e-3   # 0.1% of spot
+    _GAMMA_BUMP = 1e-3   # 0.1% of spot (same as delta for consistency)
+    _VEGA_BUMP  = 1e-4   # absolute σ bump (1bp of vol)
+ 
     def __init__(self, contract, pricer, quantity, underlying_ticker, label=None):
         self.contract           = contract
         self.pricer             = pricer
         self.quantity           = float(quantity)
         self.underlying_ticker  = underlying_ticker
         self.label              = label or repr(contract)
-    
+ 
     def price(self):
         """Unit price (single contract)."""
         return self.pricer.price(self.contract)
-
+ 
     def value(self):
         """Total value of the option position (AUD)."""
         return self.quantity * self.pricer.price(self.contract)
-
+ 
     def delta(self):
         """
-        Position delta, computed via central finite difference on S0.
-
-        delta_per_contract = (price(S0 + dS) - price(S0 - dS)) / (2 * dS)
+        Position delta, central finite difference on S0.
+ 
+        delta_per_contract = (price(S0+dS) - price(S0-dS)) / (2*dS)
         position_delta     = quantity * delta_per_contract
         """
         S0 = self.contract.S0
         dS = S0 * self._DELTA_BUMP
         price_up = self.pricer.price(_clone_contract_with(self.contract, S0=S0 + dS))
         price_dn = self.pricer.price(_clone_contract_with(self.contract, S0=S0 - dS))
-        
-        return (price_up - price_dn) / (2.0 * dS)
-
+        delta_unit = (price_up - price_dn) / (2.0 * dS)
+        return self.quantity * delta_unit
+ 
+    def gamma(self):
+        """
+        Position gamma, central finite difference on S0 (second derivative).
+ 
+        gamma_per_contract = (price(S0+dS) - 2*price(S0) + price(S0-dS)) / dS^2
+        position_gamma     = quantity * gamma_per_contract
+        """
+        S0 = self.contract.S0
+        dS = S0 * self._GAMMA_BUMP
+        p_up = self.pricer.price(_clone_contract_with(self.contract, S0=S0 + dS))
+        p_0  = self.pricer.price(self.contract)
+        p_dn = self.pricer.price(_clone_contract_with(self.contract, S0=S0 - dS))
+        gamma_unit = (p_up - 2.0 * p_0 + p_dn) / (dS ** 2)
+        return self.quantity * gamma_unit
+ 
+    def vega(self):
+        """
+        Position vega, central finite difference on volatility.
+ 
+        Reported per 1.00 unit of σ (i.e. per +100% vol change). For a
+        per-1%-vol interpretation, divide by 100.
+        """
+        sigma = self.contract.sigma
+        dv = self._VEGA_BUMP
+        p_up = self.pricer.price(_clone_contract_with(self.contract, sigma=sigma + dv))
+        p_dn = self.pricer.price(_clone_contract_with(self.contract, sigma=sigma - dv))
+        vega_unit = (p_up - p_dn) / (2.0 * dv)
+        return self.quantity * vega_unit
+ 
+    def delta_dollars(self):
+        """
+        Delta-dollars = position's first-order $ sensitivity to a 100%
+        proportional move in its underlying.
+ 
+        For an option: delta_dollars = position_delta * S0.
+        (position_delta is already quantity-weighted by self.delta().)
+        """
+        return self.delta() * self.contract.S0
+ 
     def reprice(self, new_spot=None, new_yield_curve=None):
         """Return a new OptionPosition with shocked inputs."""
         new_S0 = new_spot if new_spot is not None else self.contract.S0
         new_yc = new_yield_curve if new_yield_curve is not None else self.contract.yield_curve
-
+ 
         return OptionPosition(
             contract=_clone_contract_with(self.contract, S0=new_S0, yield_curve=new_yc),
             pricer=self.pricer,
@@ -115,7 +188,7 @@ class OptionPosition:
             underlying_ticker=self.underlying_ticker,
             label=self.label,
         )
-
+ 
     def __repr__(self):
         return (
             f"OptionPosition(label={self.label!r}, "
@@ -137,11 +210,16 @@ class Portfolio:
         List of EquityPosition and/or OptionPosition objects.
 
     Methods
-        value()          -> float  : total portfolio value
-        delta()          -> float  : total portfolio delta
-        add_position()             : add a position
-        position_table() -> DataFrame : per-position breakdown (tutorial name)
-        summary_table()  -> DataFrame : alias for position_table()
+        value() / total_value()      -> float : total mark-to-market value
+        delta() / portfolio_delta()  -> float : aggregate position delta
+        portfolio_gamma()            -> float : aggregate position gamma
+        portfolio_vega()             -> float : aggregate position vega
+        delta_dollars()              -> float : total delta-dollar exposure
+                                                (slope for linear P&L approx)
+        add_position()                       : add a position
+        position_table()             -> DataFrame : per-position breakdown
+                                                    (Value, Delta, Gamma, Vega)
+        summary_table()              -> DataFrame : alias for position_table()
     """
 
     def __init__(self, positions=None):
@@ -153,7 +231,7 @@ class Portfolio:
  
     def add_position(self, instrument, quantity=None, label=None):
         """
-        Add a position
+        Add a position to the portfolio
         """
         # If instrument is already a position object, quantity lives on it
         if quantity is None:
@@ -164,36 +242,61 @@ class Portfolio:
             "label":      label or getattr(instrument, 'label', None),
         })
 
+    # ------------------------------------------------------------------
+    # Aggregate metrics
+    # ------------------------------------------------------------------
+ 
     def value(self):
-        """Compute total portfolio value."""
-        total_value = 0.0
-        for position in self.positions:
-            instrument = position["instrument"]
-            quantity   = position["quantity"]
-            total_value += quantity * instrument.price()
-        return total_value
-
+        """Total mark-to-market portfolio value."""
+        return sum(p["instrument"].value() for p in self.positions)
+ 
     def total_value(self):
-        """Aggregate mark-to-market value of the portfolio (AUD)."""
+        """Alias for value()."""
         return self.value()
-
+ 
     def delta(self):
-        """Compute total portfolio delta."""
-        total_delta = 0.0
-        for position in self.positions:
-            instrument = position["instrument"]
-            quantity   = position["quantity"]
-            total_delta += quantity * instrument.delta()
-        return total_delta
-
+        """Aggregate portfolio delta (sum of position deltas)."""
+        return sum(p["instrument"].delta() for p in self.positions)
+ 
     def portfolio_delta(self):
+        """Alias for delta()."""
         return self.delta()
-
-
+ 
+    def portfolio_gamma(self):
+        """Aggregate portfolio gamma (sum of position gammas)."""
+        return sum(p["instrument"].gamma() for p in self.positions)
+ 
+    def portfolio_vega(self):
+        """Aggregate portfolio vega (sum of position vegas)."""
+        return sum(p["instrument"].vega() for p in self.positions)
+ 
+    def delta_dollars(self):
+        """
+        Aggregate delta-dollar exposure.
+ 
+        This is the *slope* of the portfolio's linear P&L approximation
+        under a uniform proportional spot shock. For a uniform shock x:
+            PnL_linear ≈ delta_dollars * x
+        """
+        return sum(p["instrument"].delta_dollars() for p in self.positions)
+ 
+    # ------------------------------------------------------------------
+    # Reporting
+    # ------------------------------------------------------------------
+ 
     def position_table(self):
         """
-        Per-position breakdown matching tutorial column names exactly:
-        Position, Quantity, Unit Value, Position Value, Unit Delta, Position Delta
+        Per-position breakdown including all first- and second-order Greeks.
+ 
+        Columns:
+            Position, Quantity,
+            Unit Value, Position Value,
+            Unit Delta, Position Delta,
+            Unit Gamma, Position Gamma,
+            Unit Vega,  Position Vega
+ 
+        A TOTAL row is appended summing Position Value, Position Delta,
+        Position Gamma, and Position Vega.
         """
         rows = []
         for position in self.positions:
@@ -208,17 +311,29 @@ class Portfolio:
                 name = instrument.__class__.__name__
  
             unit_value = instrument.price()
-            unit_delta = instrument.delta()
-
+            # Unit Greeks = position Greek / quantity (Greeks here are
+            # position-level by convention; we divide back out for "per-unit").
+            position_delta = instrument.delta()
+            position_gamma = instrument.gamma()
+            position_vega  = instrument.vega()
+ 
+            unit_delta = position_delta / quantity if quantity else 0.0
+            unit_gamma = position_gamma / quantity if quantity else 0.0
+            unit_vega  = position_vega  / quantity if quantity else 0.0
+ 
             rows.append({
                 "Position":       name,
                 "Quantity":       quantity,
                 "Unit Value":     unit_value,
                 "Position Value": quantity * unit_value,
                 "Unit Delta":     unit_delta,
-                "Position Delta": quantity * unit_delta,
+                "Position Delta": position_delta,
+                "Unit Gamma":     unit_gamma,
+                "Position Gamma": position_gamma,
+                "Unit Vega":      unit_vega,
+                "Position Vega":  position_vega,
             })
-
+ 
         df = pd.DataFrame(rows)
         if len(df) > 0:
             total_row = pd.DataFrame([{
@@ -228,41 +343,45 @@ class Portfolio:
                 "Position Value": df["Position Value"].sum(),
                 "Unit Delta":     np.nan,
                 "Position Delta": df["Position Delta"].sum(),
+                "Unit Gamma":     np.nan,
+                "Position Gamma": df["Position Gamma"].sum(),
+                "Unit Vega":      np.nan,
+                "Position Vega":  df["Position Vega"].sum(),
             }])
             df = pd.concat([df, total_row], ignore_index=True)
  
         return df
-    
+ 
     def summary_table(self):
         """Alias for position_table() — used by the trading desk notebook."""
         return self.position_table()
-
-
+ 
+ 
 # ======================================================================
 # Risk Engine
 # ======================================================================
-
+ 
 class RiskEngine:
     """
-    Portfolio risk metrics: historical VaR, parametric VaR, scenario analysis.
+    Portfolio risk metrics: historical VaR, parametric VaR, scenario analysis,
+    and delta-linearisation vs full-revaluation P&L curves.
  
-    historical_var(returns, alpha, horizon_days)
-    but also accepts no arguments (uses stored returns_df).
- 
-    Extension beyond tutorial:
-        - parametric_var()
-        - scenario_analysis() / scenario_pnl_table()
-        - _portfolio_returns() for multi-ticker delta-normal weighting
+    Parameters
+    ----------
+    portfolio : Portfolio
+    returns_df : pd.DataFrame
+        Historical log-returns indexed by date, with one column per ticker
+        present in the portfolio.
     """
-
+ 
     def __init__(self, portfolio, returns_df):
         self.portfolio = portfolio
         self.returns_df = returns_df.copy()
-
+ 
     # ------------------------------------------------------------------
     # VaR methods
     # ------------------------------------------------------------------
-
+ 
     def historical_var(self, confidence=0.95, horizon=1):
         """
         Historical simulation VaR.
@@ -273,7 +392,7 @@ class RiskEngine:
         portfolio_value = self.portfolio.total_value()
         var = -np.quantile(scaled_returns, 1 - confidence) * abs(portfolio_value)
         return float(var)
-
+ 
     def parametric_var(self, confidence=0.95, horizon=1):
         """
         Parametric (delta-normal) VaR. Assumes normally distributed returns.
@@ -284,7 +403,7 @@ class RiskEngine:
         portfolio_value = self.portfolio.total_value()
         var = z * sigma * np.sqrt(horizon) * abs(portfolio_value)
         return float(var)
-
+ 
     def var_summary(self, confidence=0.95, horizon=1):
         """DataFrame comparing historical and parametric VaR."""
         hist     = self.historical_var(confidence, horizon)
@@ -297,24 +416,24 @@ class RiskEngine:
             "VaR ($)":        [round(hist, 2), round(para, 2)],
             "VaR (% NAV)":    [f"{hist/port_val:.2%}", f"{para/port_val:.2%}"],
         })
-
+ 
     # ------------------------------------------------------------------
     # Scenario analysis
     # ------------------------------------------------------------------
-
+ 
     def scenario_analysis(self, spot_shocks=None, rate_shocks=None):
         """
         Reprice under a grid of spot and rate shocks.
-        Returns DataFrame of P&L relative to base value.
+        Returns DataFrame of P&L relative to base value (full revaluation).
         """
         if spot_shocks is None:
             spot_shocks = [-0.20, -0.10, -0.05, 0.0, 0.05, 0.10, 0.20]
         if rate_shocks is None:
             rate_shocks = [-0.01, -0.005, 0.0, 0.005, 0.01]
-
+ 
         base_value = self.portfolio.total_value()
         results = {}
-
+ 
         for rate_shock in rate_shocks:
             col_pnl = []
             for spot_shock in spot_shocks:
@@ -323,39 +442,76 @@ class RiskEngine:
                 col_pnl.append(round(pnl, 2))
             col_label = f"Rate {rate_shock * 10000:+.0f}bps"
             results[col_label] = col_pnl
-
+ 
         index_labels = [f"Spot {s * 100:+.0f}%" for s in spot_shocks]
         return pd.DataFrame(results, index=index_labels)
-
+ 
     def scenario_pnl_table(self, spot_shocks=None, rate_shocks=None):
         """
         Return both a dollar P&L table and a percentage P&L table.
-        Useful for displaying side-by-side in the notebook.
-
-        Returns
-        -------
-        dollar_pnl : pd.DataFrame
-        pct_pnl    : pd.DataFrame
         """
         base_value = self.portfolio.total_value()
         dollar_pnl = self.scenario_analysis(spot_shocks, rate_shocks)
         pct_pnl = (dollar_pnl / abs(base_value) * 100).round(2)
         pct_pnl = pct_pnl.map(lambda x: f"{x:+.2f}%")
         return dollar_pnl, pct_pnl
-
+ 
+    # ------------------------------------------------------------------
+    # Delta-linearisation vs full revaluation
+    # ------------------------------------------------------------------
+ 
+    def delta_linearisation_curve(self, spot_moves=None):
+        """
+        Compare delta-linear vs full-revaluation P&L across a range of
+        uniform proportional spot moves.
+ 
+        Parameters
+        ----------
+        spot_moves : array-like, optional
+            Array of proportional spot moves (e.g. -0.20 to +0.20).
+            Defaults to 81 points spanning ±20%.
+ 
+        Returns
+        -------
+        pd.DataFrame with columns:
+            spot_move    : the proportional shock (-0.20 ... +0.20)
+            delta_pnl    : linear approximation, slope = portfolio.delta_dollars()
+            full_pnl     : full revaluation P&L under the same shock
+            convexity_gap: full_pnl - delta_pnl (the curvature term)
+        """
+        if spot_moves is None:
+            spot_moves = np.linspace(-0.20, 0.20, 81)
+        spot_moves = np.asarray(spot_moves, dtype=float)
+ 
+        base_value = self.portfolio.total_value()
+        slope      = self.portfolio.delta_dollars()
+ 
+        delta_pnl = slope * spot_moves
+        full_pnl = np.array([
+            self._reprice_portfolio(spot_shock=float(x), rate_shock=0.0) - base_value
+            for x in spot_moves
+        ])
+ 
+        return pd.DataFrame({
+            "spot_move":     spot_moves,
+            "delta_pnl":     delta_pnl,
+            "full_pnl":      full_pnl,
+            "convexity_gap": full_pnl - delta_pnl,
+        })
+ 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
-
+ 
     def _portfolio_returns(self):
         total_value  = self.portfolio.value()
         port_returns = pd.Series(np.zeros(len(self.returns_df)),
                                 index=self.returns_df.index)
-
+ 
         for position in self.portfolio.positions:
             instrument = position["instrument"]
             quantity   = position["quantity"]
-
+ 
             if isinstance(instrument, EquityPosition):
                 ticker = instrument.ticker
                 if ticker not in self.returns_df.columns:
@@ -363,48 +519,49 @@ class RiskEngine:
                                     f"Available: {list(self.returns_df.columns)}")
                 weight = (quantity * instrument.price()) / total_value
                 port_returns += weight * self.returns_df[ticker]
-
+ 
             elif isinstance(instrument, OptionPosition):
                 ticker = instrument.underlying_ticker
                 if ticker not in self.returns_df.columns:
                     raise ValueError(f"Ticker {ticker!r} not in returns_df. "
                                     f"Available: {list(self.returns_df.columns)}")
-                dollar_delta = quantity * instrument.delta() * instrument.contract.S0
+                # instrument.delta() already includes quantity
+                dollar_delta = instrument.delta() * instrument.contract.S0
                 weight       = dollar_delta / total_value
                 port_returns += weight * self.returns_df[ticker]
-
+ 
         return port_returns
-
+ 
     def _reprice_portfolio(self, spot_shock, rate_shock):
         total = 0.0
         for position in self.portfolio.positions:
             instrument = position["instrument"]
             quantity   = position["quantity"]
-
+ 
             if isinstance(instrument, EquityPosition):
                 new_spot = instrument.spot_price * (1.0 + spot_shock)
                 total   += quantity * instrument.reprice(new_spot=new_spot).price()
-
+ 
             elif isinstance(instrument, OptionPosition):
                 new_spot = instrument.contract.S0 * (1.0 + spot_shock)
                 new_yc   = _shift_yield_curve(instrument.contract.yield_curve, rate_shock)
                 total   += quantity * instrument.reprice(new_spot=new_spot,
                                                         new_yield_curve=new_yc).price()
         return total
-
-
+ 
+ 
 # ======================================================================
 # Internal utility functions
 # ======================================================================
-
+ 
 def _clone_contract_with(contract, **overrides):
     """
     Return a new contract of the same type as `contract`, with any
     parameters in `overrides` replaced.
-
-    Used by OptionPosition.delta() and OptionPosition.reprice() to create
+ 
+    Used by OptionPosition.delta()/gamma()/vega()/reprice() to create
     shocked versions of a contract without modifying the original.
-
+ 
     Carries forward base Derivative parameters plus any contract-specific
     parameters (e.g. barrier, barrier_type for BarrierCall/BarrierPut)
     so that subclasses with extended __init__ signatures clone correctly.
@@ -423,8 +580,8 @@ def _clone_contract_with(contract, **overrides):
         params["barrier_type"] = contract.barrier_type
     params.update(overrides)
     return type(contract)(**params)
-
-
+ 
+ 
 def _shift_yield_curve(yield_curve, shift):
     """New YieldCurve with all zero rates shifted by `shift` (decimal)."""
     from src.yieldcurve import YieldCurve
