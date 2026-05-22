@@ -12,28 +12,6 @@ Sits on top of derivatives/, pricers/, and yieldcurve.py to provide:
 Design principle (consistent with the rest of the platform):
     This module does NOT hard-code any specific stocks or options.
     Positions are constructed externally (e.g. in the notebook) and passed in.
-    This keeps the risk engine reusable across different portfolio compositions.
-
-Usage example (see trading_desk_analysis.ipynb for full demo):
-    from src.derivatives import EuropeanCall, EuropeanPut
-    from src.pricers import BlackScholesPricer, MonteCarloPricer
-    from src.portfolio import EquityPosition, OptionPosition, Portfolio, RiskEngine
-    from src.yieldcurve import load_rba_yield_curve, YieldCurve
-
-    maturities, rates, snap = load_rba_yield_curve("data/RBA_Government_Bond_Yields")
-    yc = YieldCurve(maturities, rates)
-
-    aapl_equity = EquityPosition(ticker="AAPL", quantity=100, spot_price=297.84)
-    aapl_put    = OptionPosition(
-                     contract=EuropeanPut(S0=297.84, K=290.0, T=0.5, sigma=0.27, yield_curve=yc),
-                     pricer=BlackScholesPricer(),
-                     quantity=2,
-                     underlying_ticker="AAPL",
-                     label="AAPL Put 6m OTM",
-                 )
-    portfolio  = Portfolio([aapl_equity, aapl_put])
-    engine     = RiskEngine(portfolio, returns_df)
-    print(engine.historical_var())
 """
 
 import numpy as np
@@ -48,58 +26,30 @@ from scipy.stats import norm
 class EquityPosition:
     """
     A long equity holding in a single stock.
-
-    Parameters
-    ----------
-    ticker : str
-        Ticker symbol (e.g. "AAPL"). Used for labelling and linking to
-        return data in the RiskEngine.
-    quantity : float
-        Number of shares held. Positive = long.
-    spot_price : float
-        Current market price per share (AUD).
-
-    Notes
-    -----
-    Delta of an equity position is always 1.0 per share, so the
-    position delta equals quantity.
     """
 
     def __init__(self, ticker, quantity, spot_price):
         if spot_price <= 0:
             raise ValueError(f"spot_price must be positive, got {spot_price}")
-        self.ticker = ticker
-        self.quantity = float(quantity)
+        self.ticker     = ticker
+        self.quantity   = float(quantity)
         self.spot_price = float(spot_price)
-        self.label = ticker
+        self.label      = ticker
 
+    def price(self):
+        """Unit price (spot)."""
+        return self.spot_price
+        
     def value(self):
         """Total market value of the equity position (AUD)."""
         return self.quantity * self.spot_price
 
     def delta(self):
-        """
-        Position delta.
-        Delta per share = 1.0 for a long equity holding.
-        """
-        return self.quantity * 1.0
+        """ Unit delta = 1.0 for equity. Position delta = quantity."""
+        return 1.0
 
     def reprice(self, new_spot=None, new_yield_curve=None):
-        """
-        Return a new EquityPosition with shocked inputs.
-
-        Parameters
-        ----------
-        new_spot : float or None
-            Shocked spot price. If None, keeps current spot_price.
-        new_yield_curve : ignored
-            Included for API consistency with OptionPosition.reprice().
-            Equity value does not depend on the yield curve directly.
-
-        Returns
-        -------
-        EquityPosition
-        """
+        """Return a new EquityPosition with shocked spot price."""
         spot = new_spot if new_spot is not None else self.spot_price
         return EquityPosition(
             ticker=self.ticker,
@@ -116,47 +66,24 @@ class EquityPosition:
 
 class OptionPosition:
     """
-    A long position in a single derivative contract.
-
-    Parameters
-    ----------
-    contract : Derivative
-        A derivative contract (EuropeanCall, EuropeanPut, BarrierCall, etc.)
-        as defined in src/derivatives/.
-    pricer : Pricer
-        A compatible pricer (BlackScholesPricer, MonteCarloPricer, etc.)
-        as defined in src/pricers/.
-    quantity : float
-        Number of contracts held. Positive = long.
-    underlying_ticker : str
-        Ticker of the underlying equity (e.g. "AAPL"). Required so the
-        RiskEngine can link this position to the correct column in the
-        historical returns DataFrame. Making this explicit (rather than
-        parsing it from the label) is robust to any ticker convention.
-    label : str, optional
-        Human-readable label for reporting (e.g. "AAPL Put 6m OTM").
-        Defaults to the contract's repr if not given.
-
-    Notes
-    -----
-    Delta is computed numerically via a central finite difference on the
-    spot price. This is model-consistent and works for any pricer, including
-    Monte Carlo (though MC delta will have simulation noise).
-
-    For Black-Scholes European options the analytical delta is:
-        Call: N(d1)       Put: N(d1) - 1
-    The finite-difference result converges to these values as dS -> 0.
+    A long derivative position with an attached pricer.
+ 
+    Delta is computed via central finite difference on S0 — model-consistent
+    and works for any pricer including Monte Carlo.
     """
-
     # Relative bump size for finite-difference delta (0.1% of spot)
     _DELTA_BUMP = 1e-3
 
     def __init__(self, contract, pricer, quantity, underlying_ticker, label=None):
-        self.contract = contract
-        self.pricer = pricer
-        self.quantity = float(quantity)
-        self.underlying_ticker = underlying_ticker
-        self.label = label or repr(contract)
+        self.contract           = contract
+        self.pricer             = pricer
+        self.quantity           = float(quantity)
+        self.underlying_ticker  = underlying_ticker
+        self.label              = label or repr(contract)
+    
+    def price(self):
+        """Unit price (single contract)."""
+        return self.pricer.price(self.contract)
 
     def value(self):
         """Total value of the option position (AUD)."""
@@ -171,41 +98,18 @@ class OptionPosition:
         """
         S0 = self.contract.S0
         dS = S0 * self._DELTA_BUMP
-
-        contract_up = _clone_contract_with(self.contract, S0=S0 + dS)
-        contract_dn = _clone_contract_with(self.contract, S0=S0 - dS)
-
-        price_up = self.pricer.price(contract_up)
-        price_dn = self.pricer.price(contract_dn)
-
-        delta_per_contract = (price_up - price_dn) / (2.0 * dS)
-        return self.quantity * delta_per_contract
+        price_up = self.pricer.price(_clone_contract_with(self.contract, S0=S0 + dS))
+        price_dn = self.pricer.price(_clone_contract_with(self.contract, S0=S0 - dS))
+        
+        return (price_up - price_dn) / (2.0 * dS)
 
     def reprice(self, new_spot=None, new_yield_curve=None):
-        """
-        Return a new OptionPosition with shocked inputs.
-
-        Parameters
-        ----------
-        new_spot : float or None
-            Shocked spot price (S0). If None, keeps current S0.
-        new_yield_curve : YieldCurve or None
-            Shocked yield curve. If None, keeps current yield curve.
-
-        Returns
-        -------
-        OptionPosition
-            A new position with the same quantity, pricer, underlying_ticker,
-            and label, but with a contract built from the shocked inputs.
-        """
+        """Return a new OptionPosition with shocked inputs."""
         new_S0 = new_spot if new_spot is not None else self.contract.S0
         new_yc = new_yield_curve if new_yield_curve is not None else self.contract.yield_curve
 
-        shocked_contract = _clone_contract_with(
-            self.contract, S0=new_S0, yield_curve=new_yc
-        )
         return OptionPosition(
-            contract=shocked_contract,
+            contract=_clone_contract_with(self.contract, S0=new_S0, yield_curve=new_yc),
             pricer=self.pricer,
             quantity=self.quantity,
             underlying_ticker=self.underlying_ticker,
@@ -233,86 +137,105 @@ class Portfolio:
         List of EquityPosition and/or OptionPosition objects.
 
     Methods
-    -------
-    total_value()       -> float         : sum of all position values
-    value()             -> float         : alias for total_value() (tutorial convention)
-    portfolio_delta()   -> float         : sum of all position deltas
-    delta()             -> float         : alias for portfolio_delta() (tutorial convention)
-    add_position(p)                       : append a new position
-    summary_table()     -> pd.DataFrame  : per-position breakdown
+        value()          -> float  : total portfolio value
+        delta()          -> float  : total portfolio delta
+        add_position()             : add a position
+        position_table() -> DataFrame : per-position breakdown (tutorial name)
+        summary_table()  -> DataFrame : alias for position_table()
     """
 
-    def __init__(self, positions):
-        if not positions:
-            raise ValueError("Portfolio must contain at least one position.")
-        self.positions = list(positions)
+    def __init__(self, positions=None):
+        self.positions = []
+        if positions:
+            for p in positions:
+                self.add_position(p, quantity=p.quantity,
+                                  label=getattr(p, 'label', None))
+ 
+    def add_position(self, instrument, quantity=None, label=None):
+        """
+        Add a position
+        """
+        # If instrument is already a position object, quantity lives on it
+        if quantity is None:
+            quantity = getattr(instrument, 'quantity', 1.0)
+        self.positions.append({
+            "instrument": instrument,
+            "quantity":   float(quantity),
+            "label":      label or getattr(instrument, 'label', None),
+        })
+
+    def value(self):
+        """Compute total portfolio value."""
+        total_value = 0.0
+        for position in self.positions:
+            instrument = position["instrument"]
+            quantity   = position["quantity"]
+            total_value += quantity * instrument.price()
+        return total_value
 
     def total_value(self):
         """Aggregate mark-to-market value of the portfolio (AUD)."""
-        return sum(p.value() for p in self.positions)
-
-    def value(self):
-        """Alias for total_value() to match the tutorial convention."""
-        return self.total_value()
-
-    def portfolio_delta(self):
-        """
-        Aggregate delta of the portfolio.
-
-        Interpretation: approximate change in portfolio value for a $1
-        increase in the underlying price. For a multi-stock portfolio this
-        is a simplification — it assumes all underlyings move together.
-        """
-        return sum(p.delta() for p in self.positions)
+        return self.value()
 
     def delta(self):
-        """Alias for portfolio_delta() to match the tutorial convention."""
-        return self.portfolio_delta()
+        """Compute total portfolio delta."""
+        total_delta = 0.0
+        for position in self.positions:
+            instrument = position["instrument"]
+            quantity   = position["quantity"]
+            total_delta += quantity * instrument.delta()
+        return total_delta
 
-    def add_position(self, position):
+    def portfolio_delta(self):
+        return self.delta()
+
+
+    def position_table(self):
         """
-        Append a new EquityPosition or OptionPosition to the portfolio.
-
-        Useful for building a portfolio incrementally in the notebook
-        rather than passing every position at construction time.
-        """
-        self.positions.append(position)
-
-    def summary_table(self):
-        """
-        Return a DataFrame with one row per position showing:
-            Label, Type, Quantity, Unit Value, Position Value, Delta
-
-        Useful for display in the notebook.
+        Per-position breakdown matching tutorial column names exactly:
+        Position, Quantity, Unit Value, Position Value, Unit Delta, Position Delta
         """
         rows = []
-        for p in self.positions:
-            if isinstance(p, EquityPosition):
-                position_type = "Equity"
-                unit_value = p.spot_price
+        for position in self.positions:
+            instrument = position["instrument"]
+            quantity   = position["quantity"]
+ 
+            if position["label"] is not None:
+                name = position["label"]
+            elif hasattr(instrument, "ticker"):
+                name = instrument.ticker
             else:
-                position_type = type(p.contract).__name__
-                unit_value = p.pricer.price(p.contract)
+                name = instrument.__class__.__name__
+ 
+            unit_value = instrument.price()
+            unit_delta = instrument.delta()
 
             rows.append({
-                "Label":              p.label,
-                "Type":               position_type,
-                "Quantity":           p.quantity,
-                "Unit Value ($)":     round(unit_value, 4),
-                "Position Value ($)": round(p.value(), 2),
-                "Delta":              round(p.delta(), 4),
+                "Position":       name,
+                "Quantity":       quantity,
+                "Unit Value":     unit_value,
+                "Position Value": quantity * unit_value,
+                "Unit Delta":     unit_delta,
+                "Position Delta": quantity * unit_delta,
             })
 
         df = pd.DataFrame(rows)
-        df.loc["Total"] = {
-            "Label":              "TOTAL",
-            "Type":               "",
-            "Quantity":           "",
-            "Unit Value ($)":     "",
-            "Position Value ($)": round(self.total_value(), 2),
-            "Delta":              round(self.portfolio_delta(), 4),
-        }
+        if len(df) > 0:
+            total_row = pd.DataFrame([{
+                "Position":       "TOTAL",
+                "Quantity":       np.nan,
+                "Unit Value":     np.nan,
+                "Position Value": df["Position Value"].sum(),
+                "Unit Delta":     np.nan,
+                "Position Delta": df["Position Delta"].sum(),
+            }])
+            df = pd.concat([df, total_row], ignore_index=True)
+ 
         return df
+    
+    def summary_table(self):
+        """Alias for position_table() — used by the trading desk notebook."""
+        return self.position_table()
 
 
 # ======================================================================
@@ -321,29 +244,15 @@ class Portfolio:
 
 class RiskEngine:
     """
-    Computes portfolio risk metrics: VaR and scenario analysis.
-
-    Parameters
-    ----------
-    portfolio : Portfolio
-        The portfolio to analyse.
-    returns_df : pd.DataFrame
-        Daily log returns for the equity underlyings. Each column is a
-        ticker (e.g. "AAPL"), each row is a trading day.
-        Used for historical VaR and parametric volatility estimation.
-
-    Notes
-    -----
-    VaR is computed at the portfolio level using a delta-normal approximation:
-        - Equity positions contribute directly via their dollar weight.
-        - Option positions contribute via delta * S0 as their dollar equity
-          exposure (linear approximation).
-        - This does not capture the nonlinear (gamma) effect of options on P&L.
-
-    Full revaluation under each historical scenario would be more accurate
-    but computationally prohibitive for Monte Carlo-priced options. This
-    limitation is acknowledged in the presentation as a known simplification
-    consistent with a prototype trading desk system.
+    Portfolio risk metrics: historical VaR, parametric VaR, scenario analysis.
+ 
+    historical_var(returns, alpha, horizon_days)
+    but also accepts no arguments (uses stored returns_df).
+ 
+    Extension beyond tutorial:
+        - parametric_var()
+        - scenario_analysis() / scenario_pnl_table()
+        - _portfolio_returns() for multi-ticker delta-normal weighting
     """
 
     def __init__(self, portfolio, returns_df):
@@ -357,28 +266,7 @@ class RiskEngine:
     def historical_var(self, confidence=0.95, horizon=1):
         """
         Historical simulation VaR.
-
-        Uses the empirical distribution of past portfolio P&L to find
-        the loss threshold at the given confidence level.
-
-        Procedure
-        ---------
-        1. Compute daily portfolio P&L from historical equity returns,
-           weighted by each position's dollar exposure.
-        2. Scale to the desired horizon (sqrt-of-time approximation).
-        3. Return the (1 - confidence) quantile of the loss distribution.
-
-        Parameters
-        ----------
-        confidence : float
-            Confidence level. Default 0.95 -> 95% VaR.
-        horizon : int
-            Holding period in days. Default 1 (1-day VaR).
-
-        Returns
-        -------
-        float
-            VaR in dollars. Positive number = potential loss.
+        Returns VaR in dollars at the given confidence level and horizon.
         """
         port_returns = self._portfolio_returns()
         scaled_returns = port_returns * np.sqrt(horizon)
@@ -388,29 +276,7 @@ class RiskEngine:
 
     def parametric_var(self, confidence=0.95, horizon=1):
         """
-        Parametric (variance-covariance) VaR.
-
-        Assumes portfolio returns are normally distributed. Uses the
-        historical standard deviation of portfolio returns scaled to
-        the desired horizon.
-
-        Procedure
-        ---------
-        1. Compute daily portfolio returns (same as historical VaR).
-        2. Estimate portfolio volatility as the standard deviation.
-        3. VaR = z_alpha * sigma * sqrt(horizon) * abs(portfolio_value)
-
-        Parameters
-        ----------
-        confidence : float
-            Confidence level. Default 0.95 -> z = 1.645.
-        horizon : int
-            Holding period in days. Default 1.
-
-        Returns
-        -------
-        float
-            VaR in dollars. Positive number = potential loss.
+        Parametric (delta-normal) VaR. Assumes normally distributed returns.
         """
         port_returns = self._portfolio_returns()
         sigma = port_returns.std()
@@ -420,25 +286,16 @@ class RiskEngine:
         return float(var)
 
     def var_summary(self, confidence=0.95, horizon=1):
-        """
-        Return a DataFrame comparing historical and parametric VaR.
-
-        Useful for displaying in the notebook and discussing the
-        normality assumption as a limitation.
-        """
-        hist = self.historical_var(confidence, horizon)
-        para = self.parametric_var(confidence, horizon)
-        portfolio_value = self.portfolio.total_value()
-
+        """DataFrame comparing historical and parametric VaR."""
+        hist     = self.historical_var(confidence, horizon)
+        para     = self.parametric_var(confidence, horizon)
+        port_val = self.portfolio.value()
         return pd.DataFrame({
             "Method":         ["Historical", "Parametric"],
             "Confidence":     [f"{confidence:.0%}", f"{confidence:.0%}"],
             "Horizon (days)": [horizon, horizon],
             "VaR ($)":        [round(hist, 2), round(para, 2)],
-            "VaR (% NAV)":    [
-                f"{hist / portfolio_value:.2%}",
-                f"{para / portfolio_value:.2%}",
-            ],
+            "VaR (% NAV)":    [f"{hist/port_val:.2%}", f"{para/port_val:.2%}"],
         })
 
     # ------------------------------------------------------------------
@@ -447,26 +304,8 @@ class RiskEngine:
 
     def scenario_analysis(self, spot_shocks=None, rate_shocks=None):
         """
-        Reprice the portfolio under a grid of spot and rate shocks.
-
-        For each combination of shocks, every position is repriced:
-            - EquityPosition : new_spot = current_spot * (1 + spot_shock)
-            - OptionPosition : new S0 and/or new yield curve (parallel shift)
-
-        Parameters
-        ----------
-        spot_shocks : list of float, optional
-            Fractional spot price changes.
-            Default: [-0.20, -0.10, -0.05, 0.0, 0.05, 0.10, 0.20]
-        rate_shocks : list of float, optional
-            Parallel yield curve shifts in decimal.
-            Default: [-0.01, -0.005, 0.0, 0.005, 0.01]  (±50bps, ±100bps)
-
-        Returns
-        -------
-        pd.DataFrame
-            Rows = spot shocks, Columns = rate shocks.
-            Each cell = portfolio P&L relative to base value (AUD).
+        Reprice under a grid of spot and rate shocks.
+        Returns DataFrame of P&L relative to base value.
         """
         if spot_shocks is None:
             spot_shocks = [-0.20, -0.10, -0.05, 0.0, 0.05, 0.10, 0.20]
@@ -509,65 +348,48 @@ class RiskEngine:
     # ------------------------------------------------------------------
 
     def _portfolio_returns(self):
-        """
-        Compute daily portfolio-level returns as a weighted sum of
-        underlying-ticker returns, where weights are proportional to
-        dollar exposure.
+        total_value  = self.portfolio.value()
+        port_returns = pd.Series(np.zeros(len(self.returns_df)),
+                                index=self.returns_df.index)
 
-        Equity positions: weight = position value / total portfolio value
-        Option positions: weight = (delta * S0) / total portfolio value
-                          (delta-normal approximation)
-        """
-        total_value = self.portfolio.total_value()
-        port_returns = pd.Series(
-            np.zeros(len(self.returns_df)), index=self.returns_df.index
-        )
+        for position in self.portfolio.positions:
+            instrument = position["instrument"]
+            quantity   = position["quantity"]
 
-        for p in self.portfolio.positions:
-            if isinstance(p, EquityPosition):
-                ticker = p.ticker
+            if isinstance(instrument, EquityPosition):
+                ticker = instrument.ticker
                 if ticker not in self.returns_df.columns:
-                    raise ValueError(
-                        f"Ticker {ticker!r} not found in returns_df. "
-                        f"Available: {list(self.returns_df.columns)}"
-                    )
-                weight = p.value() / total_value
+                    raise ValueError(f"Ticker {ticker!r} not in returns_df. "
+                                    f"Available: {list(self.returns_df.columns)}")
+                weight = (quantity * instrument.price()) / total_value
                 port_returns += weight * self.returns_df[ticker]
 
-            elif isinstance(p, OptionPosition):
-                ticker = p.underlying_ticker
+            elif isinstance(instrument, OptionPosition):
+                ticker = instrument.underlying_ticker
                 if ticker not in self.returns_df.columns:
-                    raise ValueError(
-                        f"Underlying ticker {ticker!r} for option position "
-                        f"{p.label!r} not found in returns_df. "
-                        f"Available: {list(self.returns_df.columns)}"
-                    )
-                dollar_delta = p.delta() * p.contract.S0
-                weight = dollar_delta / total_value
+                    raise ValueError(f"Ticker {ticker!r} not in returns_df. "
+                                    f"Available: {list(self.returns_df.columns)}")
+                dollar_delta = quantity * instrument.delta() * instrument.contract.S0
+                weight       = dollar_delta / total_value
                 port_returns += weight * self.returns_df[ticker]
 
         return port_returns
 
     def _reprice_portfolio(self, spot_shock, rate_shock):
-        """
-        Return total portfolio value after applying spot and rate shocks.
-
-        Spot shock applied proportionally to each position's current S0.
-        Rate shock is a parallel shift applied to the yield curve.
-        """
         total = 0.0
-        for p in self.portfolio.positions:
-            if isinstance(p, EquityPosition):
-                new_spot = p.spot_price * (1.0 + spot_shock)
-                shocked = p.reprice(new_spot=new_spot)
-                total += shocked.value()
+        for position in self.portfolio.positions:
+            instrument = position["instrument"]
+            quantity   = position["quantity"]
 
-            elif isinstance(p, OptionPosition):
-                new_spot = p.contract.S0 * (1.0 + spot_shock)
-                new_yc = _shift_yield_curve(p.contract.yield_curve, rate_shock)
-                shocked = p.reprice(new_spot=new_spot, new_yield_curve=new_yc)
-                total += shocked.value()
+            if isinstance(instrument, EquityPosition):
+                new_spot = instrument.spot_price * (1.0 + spot_shock)
+                total   += quantity * instrument.reprice(new_spot=new_spot).price()
 
+            elif isinstance(instrument, OptionPosition):
+                new_spot = instrument.contract.S0 * (1.0 + spot_shock)
+                new_yc   = _shift_yield_curve(instrument.contract.yield_curve, rate_shock)
+                total   += quantity * instrument.reprice(new_spot=new_spot,
+                                                        new_yield_curve=new_yc).price()
         return total
 
 
@@ -576,13 +398,7 @@ class RiskEngine:
 # ======================================================================
 
 def _clone_contract_with(contract, **overrides):
-    """
-    Return a new contract of the same type as `contract`, with any
-    parameters in `overrides` replaced.
-
-    Used by OptionPosition.delta() and OptionPosition.reprice() to create
-    shocked versions of a contract without modifying the original.
-    """
+    """New contract of the same type with overridden parameters."""
     params = {
         "S0":          contract.S0,
         "K":           contract.K,
@@ -595,11 +411,7 @@ def _clone_contract_with(contract, **overrides):
 
 
 def _shift_yield_curve(yield_curve, shift):
-    """
-    Return a new YieldCurve with all zero rates shifted by `shift` (decimal).
-
-    Used for parallel rate shock scenarios, e.g. shift=0.005 -> +50bps.
-    """
+    """New YieldCurve with all zero rates shifted by `shift` (decimal)."""
     from src.yieldcurve import YieldCurve
     shifted_rates = yield_curve.zero_rates + shift
     return YieldCurve(
