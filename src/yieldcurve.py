@@ -18,7 +18,7 @@ Public API:
     YieldCurve            -- interpolating yield curve class
 """
 
-# Row index (0-based) where the dated time series begins in the RBA F2 CSV.
+# Row index (0-based) where the dated time series begins in the RBA F17 CSV.
 # Rows 0-10 are metadata (title, description, frequency, type, units,
 # blank rows, source, publication date, series IDs). The actual data
 # starts at row 11 of the CSV.
@@ -140,7 +140,7 @@ def list_available_dates(path):
 # ----------------------------------------------------------------------
 def _read_rba_csv(path):
     """
-    Parse the RBA F2 CSV into a DataFrame indexed by date.
+    Parse the RBA F17 CSV into a DataFrame indexed by date.
 
     Handles:
         - BOM character at the start of the file (utf-8-sig encoding)

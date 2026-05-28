@@ -1,4 +1,7 @@
 # FINM3422 Assignment 3 - Risk and Derivative Platforms
+
+A prototype risk and derivatives modelling platform simulating a trading/risk desk tool: it ingests market data, constructs a yield curve, prices equity derivatives, aggregates them into a portfolio, and computes portfolio risk (Greeks, VaR, and scenario analysis).
+
 ## Team Members
 - Yi Chen (Cathy) Lin
 - Caden Rieger
@@ -6,25 +9,35 @@
 - Sienna Hockaday
 
 ## Setup
-Python 3.11 or later. Install dependencies:
+Python 3.11 or later. Install runtime dependencies:
 ```bash
-pip install numpy pandas matplotlib yfinance
+pip install numpy pandas matplotlib scipy
+```
+All market data is cached locally, so the notebooks run without any live data fetch. To **regenerate** the equity cache from source (optional), also install `yfinance`:
+```bash
+pip install yfinance
 ```
 
-## Running Notebooks
-Open notebooks in the following order in Jupyter or VS Code and run all cells from top to bottom:
-- `notebooks/yield_curve_explanation.ipynb` – yield curve construction and visualisation
-- `notebooks/derivatives_pricing_test.ipynb` – option pricing and pricer cross-validation
+## Running the Notebooks
+Open in Jupyter or VS Code and run all cells top to bottom. The recommended order follows the build of the platform from infrastructure up to integrated risk:
 
-## Reproducibility
-Random seeds are pinned in the Monte Carlo simulation notebooks. The pricing engine and yield curve are deterministic given the same pillar data. To reproduce results exactly, use the bundled `data/f2-data.csv` rather than re-fetching live RBA data.
-
-## Explanation of Notebooks
-
-- `yield_curve_explanation.ipynb` – loads the RBA F2 government bond data, constructs a zero-rate yield curve via linear interpolation, and plots both the zero rate curve and discount factor curve
-- `derivatives_pricing_test.ipynb` – prices European and American options using Black-Scholes, binomial tree, and Monte Carlo pricers; includes cross-validation and convergence checks
+1. `notebooks/yield_curve_explanation.ipynb` – yield curve construction and visualisation
+2. `notebooks/equity_data_explanation.ipynb` – equity data loading, returns, and volatility estimation
+3. `notebooks/derivatives_pricing_test.ipynb` – option pricing and pricer cross-validation
+4. `notebooks/trading_desk_analysis.ipynb` – **main notebook**: integrates all modules into portfolio valuation, Greeks, VaR, and scenario analysis
 
 ## Repository Structure
-- `data/` — RBA F2 government bond yield data and cached equity price data
-- `src/` — Reusable Python modules (yieldcurve.py, derivatives/, pricers/, portfolio.py)
+- `data/` — RBA F17 government bond yield data (`RBA_Government_Bond_Yields.csv`) and cached daily equity price data (`data/equities/`)
+- `src/` — Reusable Python modules:
+  - `yieldcurve.py` — loads RBA F17 data, interpolates zero rates, computes discount factors
+  - `derivatives/` — `Derivative` base class and option subclasses (European, American, Barrier)
+  - `pricers/` — Black-Scholes, binomial tree, and Monte Carlo pricing engines
+  - `portfolio.py` — `Portfolio` and `RiskEngine`: valuation, Greeks, VaR, and scenarios
+  - `equity_data.py` — equity panel loading, log returns, summary and correlation tables
 - `notebooks/` — Analysis notebooks as described above
+
+## Module Overview
+The platform is layered. The yield curve is the infrastructure layer that all pricing depends on for discounting. The derivatives layer prices individual contracts, with each contract type matched to its natural pricer (Black-Scholes for European, binomial for American, Monte Carlo for the path-dependent barrier). The portfolio layer aggregates mixed equity and option positions into mark-to-market value, aggregate Greeks, three VaR methods, and full-revaluation scenario analysis.
+
+## Reproducibility
+Monte Carlo pricing uses a pinned random seed (`MC_SEED = 42`), so results are reproducible run to run. The yield curve and analytical pricers are deterministic given the same input data. All market data is cached locally as CSV — no live API calls are made at runtime — so results reproduce exactly from the bundled `data/` files.
