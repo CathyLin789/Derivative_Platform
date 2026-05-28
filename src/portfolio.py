@@ -65,6 +65,10 @@ class EquityPosition:
         """Equity has no volatility exposure — zero vega."""
         return 0.0
  
+    def theta(self):
+        """Equity does not decay with time — zero theta."""
+        return 0.0
+ 
     def delta_dollars(self):
         """
         Delta-dollars = position's first-order $ sensitivity to a 100%
@@ -107,6 +111,7 @@ class OptionPosition:
     _DELTA_BUMP = 1e-3   # 0.1% of spot
     _GAMMA_BUMP = 1e-3   # 0.1% of spot (same as delta for consistency)
     _VEGA_BUMP  = 1e-4   # absolute σ bump (1bp of vol)
+    _THETA_DT   = 1.0 / 252.0   # one trading day, in years (theta horizon)
  
     def __init__(self, contract, pricer, quantity, underlying_ticker, label=None):
         self.contract           = contract
@@ -165,6 +170,29 @@ class OptionPosition:
         p_dn = self.pricer.price(_clone_contract_with(self.contract, sigma=sigma - dv))
         vega_unit = (p_up - p_dn) / (2.0 * dv)
         return self.quantity * vega_unit
+ 
+    def theta(self):
+        """
+        Position theta, one-sided finite difference on time to maturity.
+
+        Reported as the value change over one trading day (1/252 of a year):
+            theta_per_contract = price(T - dt) - price(T)
+            position_theta     = quantity * theta_per_contract
+
+        A one-sided (backward) difference is used rather than central because
+        time only moves forward — we cannot price a contract with more time
+        than it has. For a long-optionality position theta is negative: the
+        position loses value as maturity approaches, all else equal.
+        """
+        T = self.contract.T
+        dt = self._THETA_DT
+        # Guard: never bump past expiry (would give T <= 0 and break pricers)
+        if T <= dt:
+            return 0.0
+        p_now  = self.pricer.price(self.contract)
+        p_next = self.pricer.price(_clone_contract_with(self.contract, T=T - dt))
+        theta_unit = p_next - p_now
+        return self.quantity * theta_unit
  
     def delta_dollars(self):
         """
@@ -269,6 +297,10 @@ class Portfolio:
     def portfolio_vega(self):
         """Aggregate portfolio vega (sum of position vegas)."""
         return sum(p["instrument"].vega() for p in self.positions)
+ 
+    def portfolio_theta(self):
+        """Aggregate portfolio theta (sum of position thetas), per trading day."""
+        return sum(p["instrument"].theta() for p in self.positions)
  
     def delta_dollars(self):
         """

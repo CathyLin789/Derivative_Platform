@@ -13,5 +13,5 @@
 ## Written Ourselves
 - Portfolio composition and option strategy selection: all positions were chosen and justified by the team based on financial analysis.
 - All written analysis, discussion, and interpretation throughout the notebooks was written by the group independently. 
-- Choice of RBA F2 data as the yield curve source: a team decision based on using real Australian government bond data rather than a generic flat rate.
+- Choice of RBA F17 data as the yield curve source: a team decision based on using real Australian government bond data rather than a generic flat rate.
 - The limitations and next steps section of the notebook: entirely written by the group to express the constraints of the prototype.
