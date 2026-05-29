@@ -25,7 +25,9 @@ Greeks design note:
 
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
 from scipy.stats import norm
+
 
 
 # ======================================================================
@@ -622,4 +624,392 @@ def _shift_yield_curve(yield_curve, shift):
         maturities=yield_curve.maturities.copy(),
         zero_rates=shifted_rates,
         compounding=yield_curve.compounding,
+    )
+
+def build_desk_portfolio(spot, sigma, yc, bs, bt, mc):
+    """
+    Construct the trading desk's book and return an assembled Portfolio.
+
+    Parameters
+    ----------
+    spot  : dict  Ticker -> latest spot price  e.g. {"NAB.AX": 38.50, ...}
+    sigma : dict  Ticker -> annualised vol      e.g. {"NAB.AX": 0.21, ...}
+    yc    : YieldCurve
+    bs    : BlackScholesPricer
+    bt    : BinomialTreePricer
+    mc    : MonteCarloPricer
+
+    Returns
+    -------
+    Portfolio
+    """
+    from src.derivatives import EuropeanCall, EuropeanPut, AmericanPut, BarrierPut
+
+    nab_equity = EquityPosition(ticker="NAB.AX", quantity=200, spot_price=spot["NAB.AX"])
+    bhp_equity = EquityPosition(ticker="BHP.AX", quantity=150, spot_price=spot["BHP.AX"])
+
+    nab_protective_put = OptionPosition(
+        contract=AmericanPut(
+            S0=spot["NAB.AX"], K=spot["NAB.AX"] * 0.95,
+            T=0.5, sigma=sigma["NAB.AX"], yield_curve=yc,
+        ),
+        pricer=bt, quantity=3, underlying_ticker="NAB.AX",
+        label="NAB American Put 6m 5%-OTM (protective, ASX-style)",
+    )
+
+    csl_call = OptionPosition(
+        contract=EuropeanCall(
+            S0=spot["CSL.AX"], K=spot["CSL.AX"],
+            T=0.25, sigma=sigma["CSL.AX"], yield_curve=yc,
+        ),
+        pricer=bs, quantity=5, underlying_ticker="CSL.AX",
+        label="CSL Call 3m ATM (tactical convexity)",
+    )
+
+    wow_straddle_call = OptionPosition(
+        contract=EuropeanCall(
+            S0=spot["WOW.AX"], K=spot["WOW.AX"],
+            T=0.25, sigma=sigma["WOW.AX"], yield_curve=yc,
+        ),
+        pricer=bs, quantity=4, underlying_ticker="WOW.AX",
+        label="WOW Call 3m ATM (straddle leg)",
+    )
+
+    wow_straddle_put = OptionPosition(
+        contract=EuropeanPut(
+            S0=spot["WOW.AX"], K=spot["WOW.AX"],
+            T=0.25, sigma=sigma["WOW.AX"], yield_curve=yc,
+        ),
+        pricer=bs, quantity=4, underlying_ticker="WOW.AX",
+        label="WOW Put 3m ATM (straddle leg)",
+    )
+
+    bhp_barrier_put = OptionPosition(
+        contract=BarrierPut(
+            S0=spot["BHP.AX"], K=spot["BHP.AX"] * 0.95,
+            T=1.0, sigma=sigma["BHP.AX"], yield_curve=yc,
+            barrier=spot["BHP.AX"] * 0.80,
+            barrier_type="down-and-in",
+        ),
+        pricer=mc, quantity=50, underlying_ticker="BHP.AX",
+        label="BHP Barrier Put 1y K=95%, B=80% (DI tail hedge)",
+    )
+
+    return Portfolio([
+        nab_equity,
+        bhp_equity,
+        nab_protective_put,
+        csl_call,
+        wow_straddle_call,
+        wow_straddle_put,
+        bhp_barrier_put,
+    ])
+
+def plot_delta_linearisation(portfolio, engine, ax=None):
+    """
+    Figure 5.1 — Delta linearisation vs full revaluation P&L curve.
+
+    Parameters
+    ----------
+    portfolio : Portfolio
+    engine    : RiskEngine
+    ax        : matplotlib Axes, optional
+
+    Returns
+    -------
+    fig, ax
+    """
+    import matplotlib.ticker as mticker
+
+    curve = engine.delta_linearisation_curve(spot_moves=np.linspace(-0.20, 0.20, 81))
+
+    own_fig = ax is None
+    if own_fig:
+        fig, ax = plt.subplots(figsize=(9, 4))
+    else:
+        fig = None
+
+    ax.plot(curve["spot_move"] * 100, curve["full_pnl"],
+            color="steelblue", linewidth=2, label="Full revaluation")
+    ax.plot(curve["spot_move"] * 100, curve["delta_pnl"],
+            color="darkorange", linewidth=2, linestyle="--", label="Delta linearisation")
+    ax.axhline(0, color="black", linewidth=0.8, linestyle=":")
+    ax.set_xlabel("Uniform Spot Move (%)")
+    ax.set_ylabel("Portfolio P&L ($)")
+    ax.set_title("Figure 5.1 — Delta Linearisation vs Full Revaluation")
+    ax.legend()
+    ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"${x:,.0f}"))
+
+    if own_fig:
+        plt.tight_layout()
+        plt.show()
+
+    return fig, ax
+
+def build_var_table(engine):
+    """
+    Compute Historical, Parametric, and Monte Carlo VaR across confidence
+    levels and horizons, returning a summary DataFrame (Table 6.1).
+
+    Parameters
+    ----------
+    engine : RiskEngine
+
+    Returns
+    -------
+    var_table                                     : pd.DataFrame
+    (hist_95, hist_99, para_95, mc_95, es_95)     : tuple of key scalar metrics
+    """
+    def _bootstrap_var_ci(returns, confidence, horizon, n_resamples=1000, seed=42):
+        rng = np.random.default_rng(seed)
+        n = len(returns)
+        boot_vars = np.empty(n_resamples)
+        for i in range(n_resamples):
+            sample = rng.choice(returns, size=n, replace=True)
+            boot_vars[i] = -np.quantile(sample * np.sqrt(horizon), 1 - confidence)
+        return np.quantile(boot_vars, 0.025), np.quantile(boot_vars, 0.975)
+
+    def _monte_carlo_var(confidence, horizon, n_paths=20_000, seed=42):
+        rng = np.random.default_rng(seed)
+        port_rets = engine._portfolio_returns()
+        mu, sigma = port_rets.mean(), port_rets.std()
+        pnl = rng.normal(mu, sigma, n_paths) * np.sqrt(horizon) * abs(engine.portfolio.total_value())
+        return float(-np.quantile(pnl, 1 - confidence))
+
+    def _expected_shortfall(confidence, horizon):
+        port_rets = engine._portfolio_returns() * np.sqrt(horizon)
+        pnl = port_rets * abs(engine.portfolio.total_value())
+        return float(-pnl[pnl <= np.quantile(pnl, 1 - confidence)].mean())
+
+    n_obs     = len(engine.returns_df)
+    pv        = engine.portfolio.total_value()
+    port_rets = engine._portfolio_returns()
+    rows      = []
+
+    for confidence in [0.95, 0.99]:
+        for horizon in [1, 10]:
+            hist = engine.historical_var(confidence=confidence, horizon=horizon)
+            para = engine.parametric_var(confidence=confidence, horizon=horizon)
+            mc   = _monte_carlo_var(confidence, horizon)
+            es   = _expected_shortfall(confidence, horizon)
+            ci_low, ci_high = _bootstrap_var_ci(port_rets.values, confidence, horizon)
+            ci_low_d, ci_high_d = ci_low * abs(pv), ci_high * abs(pv)
+
+            rows.append({"Method": "Historical",  "Alpha": f"{int(confidence*100)}%",
+                         "Horizon (days)": horizon, "VaR ($)": round(hist, 2),
+                         "ES ($)": round(es, 2), "CI Low ($)": round(ci_low_d, 2),
+                         "CI High ($)": round(ci_high_d, 2), "n": n_obs})
+            rows.append({"Method": "Parametric",  "Alpha": f"{int(confidence*100)}%",
+                         "Horizon (days)": horizon, "VaR ($)": round(para, 2),
+                         "ES ($)": "-", "CI Low ($)": "-", "CI High ($)": "-", "n": n_obs})
+            rows.append({"Method": "Monte Carlo", "Alpha": f"{int(confidence*100)}%",
+                         "Horizon (days)": horizon, "VaR ($)": round(mc, 2),
+                         "ES ($)": "-", "CI Low ($)": "-", "CI High ($)": "-", "n": 20_000})
+
+    key_metrics = (
+        engine.historical_var(confidence=0.95, horizon=1),
+        engine.historical_var(confidence=0.99, horizon=1),
+        engine.parametric_var(confidence=0.95, horizon=1),
+        _monte_carlo_var(0.95, 1),
+        _expected_shortfall(0.95, 1),
+    )
+
+    return pd.DataFrame(rows), key_metrics
+
+def plot_pnl_distribution(engine, hist_var_95, hist_var_99, para_var_95, ax=None):
+    """
+    Figure 6.1 — Portfolio P&L distribution with VaR lines and Gaussian overlay.
+
+    Parameters
+    ----------
+    engine      : RiskEngine
+    hist_var_95 : float   Historical VaR at 95% (dollar)
+    hist_var_99 : float   Historical VaR at 99% (dollar)
+    para_var_95 : float   Parametric VaR at 95% (dollar)
+    ax          : matplotlib Axes, optional
+
+    Returns
+    -------
+    fig, ax
+    """
+    from scipy.stats import norm
+    import matplotlib.ticker as mticker
+
+    port_rets = engine._portfolio_returns()
+    daily_pnl = port_rets * abs(engine.portfolio.total_value())
+
+    own_fig = ax is None
+    if own_fig:
+        fig, ax = plt.subplots(figsize=(9, 4))
+    else:
+        fig = None
+
+    counts, edges, _ = ax.hist(daily_pnl, bins=60, color="steelblue", alpha=0.6,
+                               edgecolor="white", label="Empirical daily P&L")
+
+    mu, sigma  = daily_pnl.mean(), daily_pnl.std()
+    bin_width  = edges[1] - edges[0]
+    x          = np.linspace(daily_pnl.min(), daily_pnl.max(), 400)
+    normal_curve = norm.pdf(x, mu, sigma) * len(daily_pnl) * bin_width
+    ax.plot(x, normal_curve, color="black", linewidth=2,
+            label="Fitted Normal (parametric assumption)")
+
+    ax.axvline(-hist_var_95, color="darkorange", linewidth=2, linestyle="--",
+               label=f"Hist VaR 95% = ${hist_var_95:,.0f}")
+    ax.axvline(-hist_var_99, color="red",        linewidth=2, linestyle="--",
+               label=f"Hist VaR 99% = ${hist_var_99:,.0f}")
+    ax.axvline(-para_var_95, color="purple",     linewidth=2, linestyle=":",
+               label=f"Param VaR 95% = ${para_var_95:,.0f}")
+
+    ax.set_xlabel("Daily P&L ($)")
+    ax.set_ylabel("Frequency")
+    ax.set_title("Figure 6.1 — Portfolio P&L Distribution: Empirical vs Gaussian")
+    ax.xaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"${x:,.0f}"))
+    ax.legend(fontsize=8)
+
+    if own_fig:
+        plt.tight_layout()
+        plt.show()
+
+    return fig, ax
+
+def build_scenario_table(engine):
+    """
+    Table 7.1 — Named stress scenarios with full revaluation.
+
+    Parameters
+    ----------
+    engine : RiskEngine
+
+    Returns
+    -------
+    pd.DataFrame
+    """
+    named_scenarios = [
+        {"Name": "Base Case",               "Spot Shock":  0.00, "Rate Shock (bps)":   0},
+        {"Name": "Bull Market (+10%)",      "Spot Shock":  0.10, "Rate Shock (bps)":   0},
+        {"Name": "Bear Market (-10%)",      "Spot Shock": -0.10, "Rate Shock (bps)":   0},
+        {"Name": "Crash (-20%)",            "Spot Shock": -0.20, "Rate Shock (bps)":   0},
+        {"Name": "Rate Hike +100bps",       "Spot Shock":  0.00, "Rate Shock (bps)": 100},
+        {"Name": "Rate Cut -100bps",        "Spot Shock":  0.00, "Rate Shock (bps)":-100},
+        {"Name": "Stagflation (-5%,+50bps)","Spot Shock": -0.05, "Rate Shock (bps)":  50},
+        {"Name": "Risk-off (-15%,-50bps)",  "Spot Shock": -0.15, "Rate Shock (bps)": -50},
+    ]
+
+    base_val = engine.portfolio.total_value()
+    rows = []
+    for sc in named_scenarios:
+        new_val = engine._reprice_portfolio(
+            spot_shock=sc["Spot Shock"],
+            rate_shock=sc["Rate Shock (bps)"] / 10_000,
+        )
+        pnl = new_val - base_val
+        rows.append({
+            "Scenario":            sc["Name"],
+            "Spot Shock":          f"{sc['Spot Shock']:+.0%}",
+            "Rate Shock (bps)":    f"{sc['Rate Shock (bps)']:+d}",
+            "Portfolio Value ($)": round(new_val, 2),
+            "P&L ($)":             round(pnl, 2),
+            "P&L (%)":             f"{pnl/abs(base_val):+.2%}",
+        })
+
+    return pd.DataFrame(rows)
+
+def plot_pnl_surface(engine, ax=None):
+    """
+    Figure 7.1 — Portfolio P&L surface (full revaluation) across a
+    spot x rate shock grid.
+
+    Parameters
+    ----------
+    engine : RiskEngine
+    ax     : matplotlib Axes, optional
+
+    Returns
+    -------
+    fig, ax
+    """
+    spot_shocks = np.linspace(-0.30, 0.30, 25)
+    rate_shocks = np.linspace(-0.02, 0.02, 9)
+    base_val    = engine.portfolio.total_value()
+
+    pnl_matrix = np.zeros((len(spot_shocks), len(rate_shocks)))
+    for i, ss in enumerate(spot_shocks):
+        for j, rs in enumerate(rate_shocks):
+            pnl_matrix[i, j] = engine._reprice_portfolio(ss, rs) - base_val
+
+    own_fig = ax is None
+    if own_fig:
+        fig, ax = plt.subplots(figsize=(10, 6))
+    else:
+        fig = None
+
+    X, Y   = np.meshgrid(rate_shocks * 10_000, spot_shocks * 100)
+    levels = np.linspace(pnl_matrix.min(), pnl_matrix.max(), 20)
+    cf     = ax.contourf(X, Y, pnl_matrix, levels=levels, cmap="RdYlGn")
+    cs     = ax.contour(X, Y, pnl_matrix, levels=[0], colors="black",
+                        linewidths=1.5, linestyles="--")
+    plt.colorbar(cf, ax=ax, label="P&L ($)")
+    ax.clabel(cs, fmt="Break-even", fontsize=9)
+    ax.set_xlabel("Rate Shock (bps)")
+    ax.set_ylabel("Spot Shock (%)")
+    ax.set_title("Figure 7.1 — Portfolio P&L Surface (Full Revaluation)")
+
+    if own_fig:
+        plt.tight_layout()
+        plt.show()
+
+    return fig, ax
+
+def build_risk_dashboard(portfolio, engine, mc_v95, es_95, hist_var_95, para_var_95):
+    """
+    Table 9.1 — Head Desk Risk Dashboard.
+
+    Parameters
+    ----------
+    portfolio   : Portfolio
+    engine      : RiskEngine
+    mc_v95      : float   Monte Carlo VaR 95% 1d (from build_var_table)
+    es_95       : float   Expected Shortfall 95% 1d (from build_var_table)
+    hist_var_95 : float   Historical VaR 95% 1d (from build_var_table)
+    para_var_95 : float   Parametric VaR 95% 1d (from build_var_table)
+
+    Returns
+    -------
+    pd.DataFrame
+    """
+    rows = [
+        ("Portfolio Value",            f"${portfolio.total_value():,.2f}"),
+        ("Portfolio Delta",            f"{portfolio.portfolio_delta():.4f}"),
+        ("Portfolio Gamma",            f"{portfolio.portfolio_gamma():.4f}"),
+        ("Portfolio Vega",             f"{portfolio.portfolio_vega():.4f}"),
+        ("Portfolio Theta (per day)",  f"{portfolio.portfolio_theta():.4f}"),
+        ("Historical VaR 95% 1d",     f"${hist_var_95:,.2f}"),
+        ("Parametric VaR 95% 1d",     f"${para_var_95:,.2f}"),
+        ("Monte Carlo VaR 95% 1d",    f"${mc_v95:,.2f}"),
+        ("Expected Shortfall 95% 1d", f"${es_95:,.2f}"),
+    ]
+    return pd.DataFrame(rows, columns=["Metric", "Value"])
+
+def build_dollar_delta_table(portfolio):
+    """
+    Table 9.2 — Dollar delta exposure aggregated by underlier.
+
+    Parameters
+    ----------
+    portfolio : Portfolio
+
+    Returns
+    -------
+    pd.DataFrame
+    """
+    dollar_delta = {}
+    for p in portfolio.positions:
+        inst   = p["instrument"]
+        ticker = inst.ticker if isinstance(inst, EquityPosition) else inst.underlying_ticker
+        dollar_delta[ticker] = dollar_delta.get(ticker, 0.0) + inst.delta_dollars()
+
+    return pd.DataFrame(
+        [(k, f"${v:,.2f}") for k, v in dollar_delta.items()],
+        columns=["Underlier", "Dollar Delta ($)"],
     )
