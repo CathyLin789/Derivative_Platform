@@ -146,11 +146,6 @@ def load_equity_data(ticker, start_date, end_date, cache_path=None, refresh=Fals
     # ---- Sanity checks ----
     _validate_price_data(df, ticker, start_date, end_date, source)
 
-    print(
-        f"Loaded {len(df)} daily observations for {ticker} from {source}\n"
-        f"  Date range: {df.index.min().date()} to {df.index.max().date()}\n"
-        f"  Latest close: {df['Close'].iloc[-1]:.2f}"
-    )
     return df
 
 
