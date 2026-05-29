@@ -257,3 +257,57 @@ class YieldCurve:
         plt.tight_layout()
         plt.show()
 
+def plot_yield_curve(yc, maturities, zero_rates, snap_date, ax=None):
+    """
+    Plot the RBA nominal government bond curve: zero rates (left) and
+    discount factors (right).
+
+    Produces Figure 2.1 (zero-rate curve with pillar scatter) and
+    Figure 2.2 (discount factor curve) side-by-side.
+
+    Parameters
+    ----------
+    yc          : YieldCurve    Fitted yield curve object.
+    maturities  : array-like    Pillar maturities in years (for scatter markers).
+    zero_rates  : array-like    Decimal zero rates at each pillar (for scatter markers).
+    snap_date   : datetime-like Snapshot date shown in the figure title.
+    ax          : array of two Axes, optional
+                  If provided, plots into those axes instead of creating a new figure.
+
+    Returns
+    -------
+    fig, axes : matplotlib Figure and array of two Axes.
+                Returns (None, axes) when axes are passed in.
+    """
+    own_fig = ax is None
+    if own_fig:
+        fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    else:
+        fig, axes = None, ax
+
+    T_grid = np.linspace(float(np.min(maturities)), float(np.max(maturities)), 200)
+    z_grid = [yc.get_zero_rate(T) * 100 for T in T_grid]
+
+    axes[0].plot(T_grid, z_grid, color="steelblue", linewidth=2)
+    axes[0].scatter(maturities, np.asarray(zero_rates) * 100,
+                    color="steelblue", zorder=5, label="RBA pillar rates")
+    axes[0].set_xlabel("Maturity (years)")
+    axes[0].set_ylabel("Zero Rate (%)")
+    axes[0].set_title("Figure 2.1 — Zero-Rate Curve")
+    axes[0].legend()
+
+    T_long  = np.linspace(0.01, 10, 200)
+    df_grid = [yc.get_discount_factor(T) for T in T_long]
+
+    axes[1].plot(T_long, df_grid, color="darkorange", linewidth=2)
+    axes[1].set_xlabel("Maturity (years)")
+    axes[1].set_ylabel("Discount Factor")
+    axes[1].set_title("Figure 2.2 — Discount Factor Curve")
+
+    if own_fig:
+        fig.suptitle(f"RBA Nominal Government Bond Curve — {pd.Timestamp(snap_date).date()}",
+                     fontsize=12, y=1.02)
+        plt.tight_layout()
+        plt.show()
+
+    return fig, axes
